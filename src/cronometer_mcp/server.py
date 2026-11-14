@@ -4,6 +4,8 @@ import importlib.metadata
 import json
 import logging
 import os
+import threading
+import uuid
 from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
@@ -12,7 +14,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import Icon
 
 from . import paging
-from .client import CronometerClient
+from .client import CronometerClient, CronometerError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -68,15 +70,104 @@ mcp = FastMCP(
 # MCP SDK's own version, so initialize was reporting the SDK's number as ours.
 mcp._mcp_server.version = __version__
 paging.register(mcp)
+# A paged result belongs to the person whose call made it.
+paging.owner = lambda: _subject()
 
 _client: CronometerClient | None = None
+
+# Multi-user mode (accounts.py): one client pair per signed-in person, made
+# from their stored credentials the first time one of their tools runs.
+_accounts = None
+_user_clients: dict[str, CronometerClient] = {}
+_user_web_clients: dict = {}
+_pool_lock = threading.Lock()
+
+
+def _subject() -> str:
+    """Whose account this tool call is for: the token's subject, or the owner.
+
+    stdio and an MCP_API_KEY call are the owner. The SDK binds every HTTP
+    session to the token that opened it, so one person's session cannot carry
+    another person's calls.
+    """
+    from mcp.server.auth.middleware.auth_context import get_access_token
+
+    from .accounts import OWNER
+
+    token = get_access_token()
+    if token is None:
+        try:
+            user = mcp.get_context().request_context.request.scope.get("user")
+            token = getattr(user, "access_token", None)
+        except Exception:
+            token = None
+    return (token.subject if token else None) or OWNER
+
+
+def _user_credentials(subject: str) -> tuple[str, str]:
+    creds = _accounts.get(subject) if _accounts is not None else None
+    if creds is None:
+        raise CronometerError(
+            "This connection's Cronometer account is no longer on the server. "
+            "Disconnect and connect again."
+        )
+    return creds
 
 
 def _get_client() -> CronometerClient:
     global _client
+    from .accounts import OWNER, subject_dir
+
+    subject = _subject()
+    if subject != OWNER:
+        with _pool_lock:
+            client = _user_clients.get(subject)
+            if client is None:
+                email, password = _user_credentials(subject)
+                client = CronometerClient(
+                    username=email,
+                    password=password,
+                    session_path=subject_dir(subject) / "session.json",
+                )
+                _user_clients[subject] = client
+        return client
     if _client is None:
         _client = CronometerClient()
     return _client
+
+
+def _verify_cronometer(email: str, password: str) -> str:
+    """Log in as this person; returns their subject. Raises WrongPassword."""
+    import httpx
+
+    from .accounts import subject_dir
+    from .auth import WrongPassword
+    from .client import TwoFactorRequired
+
+    scratch = subject_dir("_signin") / f"{uuid.uuid4().hex}.json"
+    client = CronometerClient(username=email, password=password, session_path=scratch)
+    try:
+        client.login()
+    except TwoFactorRequired:
+        raise
+    except CronometerError as e:
+        raise WrongPassword() from e
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (400, 401, 403):
+            raise WrongPassword() from e
+        raise
+    finally:
+        scratch.unlink(missing_ok=True)
+    subject = f"cm-{client.user_id}"
+    # Keep this login: the person's first tool call then needs no second one.
+    client._session_path = subject_dir(subject) / "session.json"
+    client._save_cached_session()
+    with _pool_lock:
+        old_web = _user_web_clients.pop(subject, None)
+        _user_clients[subject] = client
+    if old_web is not None:
+        logger.info("Replaced the web session for %s after a new sign-in", subject)
+    return subject
 
 
 def _parse_date(d: str | None) -> date | None:
@@ -1868,9 +1959,21 @@ _web_client = None
 
 def _get_web_client():
     global _web_client
-    if _web_client is None:
-        from .web import CronometerWebClient
+    from .accounts import OWNER, subject_dir
+    from .web import CronometerWebClient
 
+    subject = _subject()
+    if subject != OWNER:
+        with _pool_lock:
+            web = _user_web_clients.get(subject)
+            if web is None:
+                email, password = _user_credentials(subject)
+                web = CronometerWebClient(
+                    email, password, cookie_path=subject_dir(subject) / ".session_cookies"
+                )
+                _user_web_clients[subject] = web
+        return web
+    if _web_client is None:
         _web_client = CronometerWebClient()
     return _web_client
 
@@ -2639,18 +2742,32 @@ def _enable_remote(public_url: str, host: str, port: int) -> None:
 
     from .auth import SCOPE, PasswordOAuthProvider
 
+    global _accounts
     password = os.getenv("MCP_AUTH_PASSWORD", "")
-    if not password:
+    secret = os.getenv("MCP_SECRET_KEY", "")
+    if secret:
+        from .accounts import AccountStore, allowed_emails
+
+        _accounts = AccountStore(secret)
+        allowed = allowed_emails()
+        logger.info(
+            "Multi-user mode: people sign in with their own Cronometer account (%s)",
+            "anyone" if allowed is None else f"owner + {len(allowed)} allowed emails",
+        )
+    elif not password:
         raise SystemExit(
             "MCP_PUBLIC_URL is set, so this server is reachable from the internet: "
             "set MCP_AUTH_PASSWORD too (8+ characters). It is the password you type "
-            "when ChatGPT or Claude connects."
+            "when ChatGPT or Claude connects. Or set MCP_SECRET_KEY so each person "
+            "signs in with their own Cronometer account."
         )
     provider = PasswordOAuthProvider(
         password,
         public_url,
         api_key=os.getenv("MCP_API_KEY") or None,
         local_url=f"http://localhost:{port}",
+        accounts=_accounts,
+        verify=_verify_cronometer if _accounts is not None else None,
     )
     mcp.settings.auth = AuthSettings(
         issuer_url=public_url,

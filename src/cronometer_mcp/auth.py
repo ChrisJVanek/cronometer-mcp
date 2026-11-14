@@ -4,9 +4,15 @@ Both apps add a remote MCP server by URL and then run the standard MCP
 authorization flow against it: discover the metadata, register themselves
 (dynamic client registration), send the user to /authorize, and swap the code
 for a token. This module is the authorization server for that flow, built on
-the MCP SDK's handlers. It has a single user: whoever knows MCP_AUTH_PASSWORD.
+the MCP SDK's handlers.
 
-The consent step is a small password page at /login. Clients, codes and
+By default it has a single user: whoever knows MCP_AUTH_PASSWORD, and every
+tool runs against the account in CRONOMETER_USERNAME. With MCP_SECRET_KEY set
+it has many (accounts.py): the page asks for a Cronometer email and password,
+checks them against Cronometer, and the tokens it issues carry that person's
+subject, so their tools run against their own account.
+
+The consent step is a small page at /login. Clients, codes and
 tokens are kept in a JSON file so a restart does not disconnect every chat.
 
 A fixed MCP_API_KEY is also accepted as a bearer token, for clients such as
@@ -21,8 +27,10 @@ import os
 import secrets
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
+import anyio
 from mcp.server.auth.provider import (
     AccessToken,
     AuthorizationCode,
@@ -61,8 +69,15 @@ class PasswordOAuthProvider:
         api_key: str | None = None,
         state_path: Path | None = None,
         local_url: str = "http://localhost:8430",
+        accounts=None,
+        verify: Callable[[str, str], str] | None = None,
     ) -> None:
-        if len(password) < 8:
+        # accounts (an AccountStore) and verify turn on multi-user mode: verify
+        # logs in to Cronometer with an email and password and returns that
+        # person's subject, raising on a wrong password.
+        self._accounts = accounts
+        self._verify = verify
+        if accounts is None and len(password) < 8:
             raise ValueError("MCP_AUTH_PASSWORD must be at least 8 characters")
         self._password = password
         self._api_key = api_key or None
@@ -149,9 +164,13 @@ class PasswordOAuthProvider:
             pending = self._state["pending"].get(request_id)
             if not pending or pending["expires_at"] < time.time():
                 return HTMLResponse(_page("This sign-in link has expired. Start again from the app."), 400)
+            if self._accounts is not None:
+                return HTMLResponse(_account_form(request_id, pending))
             return HTMLResponse(_form(request_id, pending, self.local_url))
 
         form = await request.form()
+        if self._accounts is not None:
+            return await self._account_login(form)
         request_id = str(form.get("request", ""))
         password = str(form.get("password", ""))
         with self._lock:
@@ -164,6 +183,59 @@ class PasswordOAuthProvider:
                 self._failures.append(time.time())
                 return HTMLResponse(_form(request_id, pending, self.local_url, error=True), 401)
             target = self._grant(request_id)
+        return RedirectResponse(target, status_code=302)
+
+    async def _account_login(self, form) -> Response:
+        """Multi-user consent: sign in with the person's own Cronometer account."""
+        from . import accounts as acct
+
+        request_id = str(form.get("request", ""))
+        email = str(form.get("email", "")).strip()
+        password = str(form.get("password", ""))
+        pending = self._state["pending"].get(request_id)
+        if not pending or pending["expires_at"] < time.time():
+            return HTMLResponse(_page("This sign-in link has expired. Start again from the app."), 400)
+
+        def again(message: str, status: int) -> Response:
+            return HTMLResponse(_account_form(request_id, pending, email=email, error=message), status)
+
+        if self._too_many_failures():
+            return HTMLResponse(_page("Too many failed sign-ins. Wait 15 minutes."), 429)
+        if not acct.is_allowed(email):
+            logger.info("Refused a sign-in from an email not on MCP_ALLOWED_EMAILS")
+            return again("This email isn't on this server's list. Ask whoever runs it to add you.", 403)
+
+        if email.lower() == acct.owner_email():
+            owner_password = os.getenv("CRONOMETER_PASSWORD", "")
+            if not owner_password or not hmac.compare_digest(password.encode(), owner_password.encode()):
+                self._failures.append(time.time())
+                return again("Wrong email or password.", 401)
+            subject = acct.OWNER
+        else:
+            from .client import TwoFactorRequired
+
+            try:
+                subject = await anyio.to_thread.run_sync(self._verify, email, password)
+            except TwoFactorRequired:
+                return again(
+                    "This Cronometer account has two-factor login on, and the server can't "
+                    "sign in to it on its own. Turn two-factor off in Cronometer's settings, "
+                    "then try again.",
+                    400,
+                )
+            except _WrongPassword:
+                self._failures.append(time.time())
+                return again("Wrong email or password.", 401)
+            except Exception:
+                logger.exception("Cronometer sign-in check failed")
+                return again("Couldn't reach Cronometer just now. Try again in a minute.", 502)
+            self._accounts.put(subject, email, password)
+
+        with self._lock:
+            if request_id not in self._state["pending"]:
+                return HTMLResponse(_page("This sign-in link has expired. Start again from the app."), 400)
+            target = self._grant(request_id, subject)
+        logger.info("Signed in %s", subject)
         return RedirectResponse(target, status_code=302)
 
     def _is_local(self, request: Request) -> bool:
@@ -207,7 +279,7 @@ class PasswordOAuthProvider:
             target = self._grant(request_id)
         return RedirectResponse(target, status_code=302)
 
-    def _grant(self, request_id: str) -> str:
+    def _grant(self, request_id: str, subject: str = "owner") -> str:
         """Turn a pending /authorize into a code; returns the client redirect.
         Caller holds the lock."""
         pending = self._state["pending"].pop(request_id)
@@ -222,7 +294,7 @@ class PasswordOAuthProvider:
             redirect_uri=params.redirect_uri,
             redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
             resource=params.resource,
-            subject="owner",
+            subject=subject,
         ).model_dump(mode="json")
         self._save()
         logger.info("Authorized OAuth client %s", pending["client_id"])
@@ -238,11 +310,18 @@ class PasswordOAuthProvider:
             return None
         return AuthorizationCode.model_validate(raw)
 
-    def _issue(self, client_id: str, scopes: list[str], resource: str | None) -> OAuthToken:
+    def _issue(
+        self, client_id: str, scopes: list[str], resource: str | None, subject: str | None
+    ) -> OAuthToken:
         access = secrets.token_urlsafe(32)
         refresh = secrets.token_urlsafe(32)
         now = int(time.time())
-        common = {"client_id": client_id, "scopes": scopes, "resource": resource, "subject": "owner"}
+        common = {
+            "client_id": client_id,
+            "scopes": scopes,
+            "resource": resource,
+            "subject": subject or "owner",
+        }
         self._state["access"][access] = {"token": access, "expires_at": now + ACCESS_TTL, **common}
         self._state["refresh"][refresh] = {"token": refresh, "expires_at": now + REFRESH_TTL, **common}
         self._save()
@@ -260,7 +339,12 @@ class PasswordOAuthProvider:
         with self._lock:
             if self._state["codes"].pop(authorization_code.code, None) is None:
                 raise TokenError("invalid_grant", "authorization code already used")
-            return self._issue(client.client_id, authorization_code.scopes, authorization_code.resource)
+            return self._issue(
+                client.client_id,
+                authorization_code.scopes,
+                authorization_code.resource,
+                authorization_code.subject,
+            )
 
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
@@ -280,7 +364,12 @@ class PasswordOAuthProvider:
             # Rotate: a refresh token works once.
             if self._state["refresh"].pop(refresh_token.token, None) is None:
                 raise TokenError("invalid_grant", "refresh token already used")
-            return self._issue(client.client_id, scopes or refresh_token.scopes, refresh_token.resource)
+            return self._issue(
+                client.client_id,
+                scopes or refresh_token.scopes,
+                refresh_token.resource,
+                refresh_token.subject,
+            )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         if self._api_key and hmac.compare_digest(token.encode(), self._api_key.encode()):
@@ -340,6 +429,27 @@ change your Cronometer diary.</p>
     )
 
 
+def _account_form(request_id: str, pending: dict, *, email: str = "", error: str = "") -> str:
+    client_name = pending.get("client_name") or "An app"
+    message = f'<p class="err">{html.escape(error)}</p>' if error else ""
+    return _page(
+        f"""<h1>Connect Cronometer</h1>
+<p><b>{html.escape(client_name)}</b> ({html.escape(_redirect_host(pending))}) wants to read and
+change your Cronometer diary. Sign in with your Cronometer account.</p>
+{message}
+<form method="post" action="/login">
+<input type="hidden" name="request" value="{html.escape(request_id)}">
+<input type="email" name="email" placeholder="Cronometer email" value="{html.escape(email)}"
+ autocomplete="username" autofocus required>
+<input type="password" name="password" placeholder="Cronometer password"
+ autocomplete="current-password" required style="margin-top:8px">
+<button type="submit">Allow</button>
+</form>
+<p style="font-size:14px">The server keeps your Cronometer password, encrypted, so it can stay
+signed in for you.</p>"""
+    )
+
+
 def _approve_form(request_id: str, pending: dict) -> str:
     client_name = pending.get("client_name") or "An app"
     return _page(
@@ -353,4 +463,10 @@ After you allow it, you go back to <b>{html.escape(_redirect_host(pending))}</b>
     )
 
 
-__all__ = ["SCOPE", "AuthorizeError", "PasswordOAuthProvider"]
+class _WrongPassword(Exception):
+    """verify() raises this when Cronometer rejects the email or password."""
+
+
+WrongPassword = _WrongPassword
+
+__all__ = ["SCOPE", "AuthorizeError", "PasswordOAuthProvider", "WrongPassword"]

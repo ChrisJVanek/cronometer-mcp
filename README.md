@@ -59,13 +59,28 @@ If you have also added the remote connector below to your claude.ai account, Cla
 The `Dockerfile` here runs the server in HTTP mode, ready for ChatGPT and claude.ai:
 
 - **Build:** point a Railway service (or any Docker host) at this repo. The `Dockerfile` needs no build arguments.
-- **Variables:** `CRONOMETER_USERNAME`, `CRONOMETER_PASSWORD`, `MCP_AUTH_PASSWORD`, `MCP_PUBLIC_URL` (your public HTTPS address, e.g. `https://cronometer.example.com`), optionally `MCP_API_KEY` and `CRONOMETER_ACCOUNT_TZ`, and `MCP_ALLOWED_HOSTS` for any other domain it should answer on (Railway's own `*.up.railway.app` name is accepted automatically).
+- **Variables:** `CRONOMETER_USERNAME`, `CRONOMETER_PASSWORD`, `MCP_AUTH_PASSWORD` (or `MCP_SECRET_KEY` for [several people](#several-people-on-one-server)), `MCP_PUBLIC_URL` (your public HTTPS address, e.g. `https://cronometer.example.com`), optionally `MCP_API_KEY` and `CRONOMETER_ACCOUNT_TZ`, and `MCP_ALLOWED_HOSTS` for any other domain it should answer on (Railway's own `*.up.railway.app` name is accepted automatically).
 - **Volume:** mount one at `/data`. It holds the Cronometer sessions and the OAuth clients and tokens, so redeploys don't disconnect anything.
 - **Health check:** `/health`.
 
 Connecting a new app on a hosted server means typing `MCP_AUTH_PASSWORD` on the connect page. The "approve on this computer" shortcut only works when the server runs on your own machine.
 
 When moving from one host to another, set `MCP_OAUTH_IMPORT` to the old `oauth.json`, base64 encoded, for one deploy. Connected apps then keep working without signing in again. Remove the variable once the log says `Imported OAuth state`.
+
+### Several people on one server
+
+A hosted server can serve more than one Cronometer account. Set two more variables:
+
+- `MCP_SECRET_KEY`: 16+ characters, e.g. from `openssl rand -base64 32`. Keep it and never change it: it encrypts the Cronometer passwords the server keeps, and a new key means everyone connects again.
+- `MCP_ALLOWED_EMAILS`: the Cronometer emails allowed to connect besides yours, comma separated, e.g. `mum@example.com,dad@example.com`. `*` lets in anyone with a Cronometer account.
+
+The connect page then asks for a **Cronometer email and password** instead of the server password. The server checks them by signing in to Cronometer, and from then on every tool that person's app calls runs against their own diary. You sign in with the account in `CRONOMETER_USERNAME`, and apps you connected before keep working. Everyone uses the same connector URL (`https://<your server>/mcp`).
+
+Good to know:
+
+- The server keeps each person's Cronometer password (encrypted, in `accounts.json` on the volume) so it can sign in again when Cronometer's session expires. Whoever runs the server could read them, so only invite people who trust you.
+- Accounts with two-factor login on can't connect: the server has no way to get their code. They can turn two-factor off in Cronometer.
+- `MCP_AUTH_PASSWORD` is no longer needed in this mode. `MCP_API_KEY` and the local "approve on this computer" shortcut still mean your own account.
 
 ### ChatGPT and claude.ai (remote, HTTPS + OAuth)
 
@@ -94,7 +109,7 @@ Logs: `~/Library/Logs/cronometer-mcp.log`. Health check: `GET /health`.
 ## Development
 
 ```bash
-uv run pytest          # 78 tests, offline
+uv run pytest          # 84 tests, offline
 uv run ruff check src
 ```
 

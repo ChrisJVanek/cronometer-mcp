@@ -284,9 +284,10 @@ wheels = [
 
 [[package]]
 name = "cronometer-mcp"
-version = "2.0.0"
+version = "2.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "httpx", extra = ["socks"] },
     { name = "mcp" },
     { name = "python-dotenv" },
@@ -308,6 +309,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=42" },
     { name = "httpx", extras = ["socks"], specifier = ">=0.27.0" },
     { name = "mcp", specifier = ">=1.30.0,<2" },
     { name = "pyotp", marker = "extra == 'totp'", specifier = ">=2.9.0" },

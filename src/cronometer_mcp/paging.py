@@ -18,6 +18,12 @@ _INLINE = 2_000
 # ponytail: count-capped LRU in process memory; results are lost on restart.
 _KEPT = 8
 _results: OrderedDict = OrderedDict()
+_owners: dict[str, str | None] = {}
+
+
+def owner() -> str | None:
+    """Whose call this is; the server replaces it when several people share it."""
+    return None
 
 _HINT = (
     "Large result, sent in pages. Call get_result_page with this result_id and "
@@ -93,8 +99,10 @@ def fit(payload) -> str:
     if lists and len(_dump(_replace(payload, {p: [] for p in lists}))) > BUDGET // 2:
         lists = {}
     _results[result_id] = (payload if lists else text, lists)
+    _owners[result_id] = owner()
     while len(_results) > _KEPT:
-        _results.popitem(last=False)
+        old, _ = _results.popitem(last=False)
+        _owners.pop(old, None)
     return _page(result_id)
 
 
@@ -207,7 +215,7 @@ def get_result_page(
         path: Which list to page when the result holds several, as named in
             `paging.lists`. Defaults to the largest.
     """
-    if result_id not in _results:
+    if result_id not in _results or _owners.get(result_id) != owner():
         return _dump({
             "status": "error",
             "message": "That result has expired. Call the original tool again.",

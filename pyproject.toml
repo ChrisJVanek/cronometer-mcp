@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cronometer-mcp"
-version = "2.0.0"
+version = "2.1.0"
 description = "MCP server for Cronometer: every feature of the existing Cronometer MCPs, for Claude and ChatGPT"
 readme = "README.md"
 license = "MIT"
@@ -19,6 +19,8 @@ dependencies = [
     "tzdata>=2024.1",
     "uvicorn>=0.30.0",
     "requests>=2.34.2",
+    # Encrypts each person's Cronometer password in multi-user mode.
+    "cryptography>=42",
 ]
 
 [project.scripts]

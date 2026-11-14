@@ -146,6 +146,10 @@ class CronometerError(Exception):
     """Raised when a Cronometer API call fails."""
 
 
+class TwoFactorRequired(CronometerError):
+    """The account has two-factor login on and no TOTP secret was given."""
+
+
 class CronometerClient:
     """Stateful client for the Cronometer mobile API.
 
@@ -153,7 +157,18 @@ class CronometerClient:
     Re-authenticates automatically when the session expires.
     """
 
-    def __init__(self, *, session_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        session_path: Path | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> None:
+        # With no username, the account is the one in CRONOMETER_USERNAME and
+        # CRONOMETER_PASSWORD (the owner), and the CRONOMETER_TOTP_SECRET and
+        # CRONOMETER_ACCOUNT_TZ overrides apply. A hosted server with several
+        # people passes each one's own credentials, and those overrides do not.
+        self._own_credentials = (username, password) if username else None
         self._user_id: int | None = None
         self._token: str | None = None
         # IANA timezone name of the Cronometer account, resolved from the login
@@ -182,6 +197,8 @@ class CronometerClient:
     def _cache_key(self) -> str:
         """Tie the cached session to the configured username so
         switching accounts invalidates the cache automatically."""
+        if self._own_credentials:
+            return self._own_credentials[0]
         return os.getenv("CRONOMETER_USERNAME", "")
 
     def _load_cached_session(self) -> None:
@@ -260,6 +277,11 @@ class CronometerClient:
             logger.debug("Could not remove cached session: %s", exc)
 
     def _get_credentials(self) -> tuple[str, str]:
+        if self._own_credentials:
+            username, password = self._own_credentials
+            if not password:
+                raise CronometerError("No Cronometer password stored for this account")
+            return username, password
         username = os.getenv("CRONOMETER_USERNAME")
         password = os.getenv("CRONOMETER_PASSWORD")
         if not username or not password:
@@ -268,14 +290,13 @@ class CronometerClient:
             )
         return username, password
 
-    @staticmethod
-    def _totp_code() -> str | None:
+    def _totp_code(self) -> str | None:
         """Current TOTP code, or None when the account has no 2FA.
 
         Cronometer rejects login with TOTP_CODE_REQUIRED when 2FA is on, so an
         unattended server needs the shared secret rather than a typed code.
         """
-        secret = os.getenv("CRONOMETER_TOTP_SECRET")
+        secret = None if self._own_credentials else os.getenv("CRONOMETER_TOTP_SECRET")
         if not secret:
             return None
         try:
@@ -326,7 +347,7 @@ class CronometerClient:
 
         if data.get("result") != "SUCCESS" and "sessionKey" not in data:
             if data.get("error") == "TOTP_CODE_REQUIRED":
-                raise CronometerError(
+                raise TwoFactorRequired(
                     "Cronometer wants a 2FA code. Set CRONOMETER_TOTP_SECRET to "
                     "the base32 secret so the server can generate its own, or "
                     "turn 2FA off for this account."
@@ -499,7 +520,7 @@ class CronometerClient:
            no longer overwrites the account's server-side zone; see #29).
         3. The historical default.
         """
-        env = self._env_timezone()
+        env = None if self._own_credentials else self._env_timezone()
         if env:
             return env
         if isinstance(response_tz, str) and response_tz:

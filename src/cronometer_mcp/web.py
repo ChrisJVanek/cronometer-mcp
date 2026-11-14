@@ -499,6 +499,7 @@ class CronometerWebClient:
         password: str | None = None,
         gwt_permutation: str | None = None,
         gwt_header: str | None = None,
+        cookie_path: Path | None = None,
     ):
         self.username = username or os.environ.get("CRONOMETER_USERNAME", "")
         self.password = password or os.environ.get("CRONOMETER_PASSWORD", "")
@@ -517,7 +518,7 @@ class CronometerWebClient:
         self.user_id: str | None = None
         self._authenticated = False
         self._diary_groups: list[dict] | None = None
-        self._cookie_path = Path(
+        self._cookie_path = cookie_path or Path(
             os.environ.get("CRONOMETER_DATA_DIR", Path.home() / ".local" / "share" / "cronometer-mcp")
         ) / ".session_cookies"
 

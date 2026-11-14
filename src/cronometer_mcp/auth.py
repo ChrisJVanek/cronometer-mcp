@@ -86,6 +86,9 @@ class PasswordOAuthProvider:
         self._path = state_path or _DEFAULT_STATE_PATH
         self._lock = threading.Lock()
         self._failures: list[float] = []
+        # Multi-user mode counts failed sign-ins per email, so one person
+        # guessing cannot lock everyone else out of the page.
+        self._email_failures: dict[str, list[float]] = {}
         self._state = self._load()
         if not self._path.exists() and self._state["clients"]:
             self._save()  # persist an import at once, before the variable goes
@@ -152,6 +155,17 @@ class PasswordOAuthProvider:
             self._save()
         return f"{self.issuer}/login?request={request_id}"
 
+    def _email_locked(self, email: str) -> bool:
+        now = time.time()
+        recent = [t for t in self._email_failures.get(email, []) if now - t < 900]
+        self._email_failures[email] = recent
+        if len(self._email_failures) > 10_000:  # keep memory bounded
+            self._email_failures = {k: v for k, v in self._email_failures.items() if v}
+        return len(recent) >= 5
+
+    def _email_failed(self, email: str) -> None:
+        self._email_failures.setdefault(email, []).append(time.time())
+
     def _too_many_failures(self) -> bool:
         now = time.time()
         self._failures = [t for t in self._failures if now - t < 900]
@@ -199,8 +213,9 @@ class PasswordOAuthProvider:
         def again(message: str, status: int) -> Response:
             return HTMLResponse(_account_form(request_id, pending, email=email, error=message), status)
 
-        if self._too_many_failures():
-            return HTMLResponse(_page("Too many failed sign-ins. Wait 15 minutes."), 429)
+        key = email.lower()
+        if self._email_locked(key):
+            return HTMLResponse(_page("Too many failed sign-ins for this email. Wait 15 minutes."), 429)
         if not acct.is_allowed(email):
             logger.info("Refused a sign-in from an email not on MCP_ALLOWED_EMAILS")
             return again("This email isn't on this server's list. Ask whoever runs it to add you.", 403)
@@ -208,7 +223,7 @@ class PasswordOAuthProvider:
         if email.lower() == acct.owner_email():
             owner_password = os.getenv("CRONOMETER_PASSWORD", "")
             if not owner_password or not hmac.compare_digest(password.encode(), owner_password.encode()):
-                self._failures.append(time.time())
+                self._email_failed(key)
                 return again("Wrong email or password.", 401)
             subject = acct.OWNER
         else:
@@ -224,7 +239,7 @@ class PasswordOAuthProvider:
                     400,
                 )
             except _WrongPassword:
-                self._failures.append(time.time())
+                self._email_failed(key)
                 return again("Wrong email or password.", 401)
             except Exception:
                 logger.exception("Cronometer sign-in check failed")

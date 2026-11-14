@@ -2752,7 +2752,7 @@ def _enable_remote(public_url: str, host: str, port: int) -> None:
         allowed = allowed_emails()
         logger.info(
             "Multi-user mode: people sign in with their own Cronometer account (%s)",
-            "anyone" if allowed is None else f"owner + {len(allowed)} allowed emails",
+            "anyone with a Cronometer account" if allowed is None else f"{len(allowed)} allowed emails",
         )
     elif not password:
         raise SystemExit(
@@ -2824,6 +2824,12 @@ def _enable_remote(public_url: str, host: str, port: int) -> None:
         return HTMLResponse(
             _page(
                 f"""<h1>Cronometer MCP</h1>
+<p>Connect your Cronometer diary to Claude or ChatGPT.</p>
+<p>Add <code>{public_url}/mcp</code> as a custom connector in Claude
+(Settings, Connectors) or ChatGPT.</p>
+<p>When it asks you to connect, sign in with your own Cronometer email and password.</p>"""
+                if _accounts is not None
+                else f"""<h1>Cronometer MCP</h1>
 <p>This is a Model Context Protocol server for a Cronometer account.</p>
 <p>Add <code>{public_url}/mcp</code> as a custom connector in ChatGPT or Claude.</p>"""
             )

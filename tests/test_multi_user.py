@@ -210,11 +210,32 @@ def test_refusals(server, http):
     assert server._accounts.subjects() == []
 
 
-def test_anyone_when_star(server, http, monkeypatch):
-    monkeypatch.setenv("MCP_ALLOWED_EMAILS", "*")
+@pytest.mark.parametrize("value", ["*", ""])
+def test_anyone_when_open(server, http, monkeypatch, value):
+    monkeypatch.setenv("MCP_ALLOWED_EMAILS", value)
     r, _ = _sign_in(http, "stranger@example.com", "anything")
     assert r.status_code == 401  # allowed through, then Cronometer said no
     assert "stranger@example.com" in server.logins
+
+
+def test_no_owner_account_needed(server, http, monkeypatch):
+    monkeypatch.delenv("CRONOMETER_USERNAME")
+    monkeypatch.delenv("CRONOMETER_PASSWORD")
+    monkeypatch.delenv("MCP_ALLOWED_EMAILS")
+    _, mum = _sign_in(http, *MUM)
+    assert _call(http, mum["access_token"], "connection_status")["user_id"] == 42
+    assert "own Cronometer email" in http.get("/").text
+
+
+def test_one_email_failing_does_not_lock_out_others(server, http, monkeypatch):
+    monkeypatch.setenv("MCP_ALLOWED_EMAILS", "*")
+    for _ in range(5):
+        r, _ = _sign_in(http, "stranger@example.com", "wrong")
+    assert r.status_code == 401
+    locked, _ = _sign_in(http, "stranger@example.com", "wrong")
+    assert locked.status_code == 429
+    ok, mum = _sign_in(http, *MUM)
+    assert ok.status_code == 302 and mum
 
 
 def test_paged_results_stay_with_their_owner(server, monkeypatch):

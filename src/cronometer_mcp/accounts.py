@@ -11,9 +11,12 @@ every tool call runs against that person's account. The owner (the account in
 CRONOMETER_USERNAME) keeps the subject "owner", so apps connected before
 multi-user mode keep working.
 
-Who may connect: the owner always, plus the emails in MCP_ALLOWED_EMAILS
-(comma separated, case ignored), or anyone with a Cronometer account when it
-is "*".
+Who may connect: anyone with a Cronometer account, unless MCP_ALLOWED_EMAILS
+(comma separated, case ignored) narrows it to those emails plus the owner.
+
+The owner account (CRONOMETER_USERNAME and CRONOMETER_PASSWORD) is optional
+here: without one, the server holds no account of its own and everyone signs
+in with theirs.
 """
 
 import base64
@@ -45,10 +48,10 @@ def _fernet(secret: str) -> Fernet:
 
 
 def allowed_emails() -> set[str] | None:
-    """The emails allowed to connect; None means anyone."""
+    """The emails allowed to connect; None (unset, or "*") means anyone."""
     raw = os.getenv("MCP_ALLOWED_EMAILS", "")
     emails = {e.strip().lower() for e in raw.split(",") if e.strip()}
-    return None if "*" in emails else emails
+    return None if not emails or "*" in emails else emails
 
 
 def owner_email() -> str:

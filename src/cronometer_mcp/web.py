@@ -1,0 +1,2782 @@
+"""Cronometer web-app client using the GWT-RPC protocol.
+
+Vendored from cphoskins/cronometer-mcp (MIT, Copyright (c) 2026 Paul Hoskins).
+The mobile API in client.py covers most of Cronometer; this covers what only
+the web app exposes: repeated items, macro target templates and the weekly
+schedule, copying between arbitrary days, cancelling a running fast, and the
+CSV exports.
+
+Authenticates via the web login flow, then exports nutrition data
+(servings, daily summaries, exercises, biometrics, notes) as CSV.
+
+NOTE: Cronometer has no public API. This client uses the same GWT-RPC
+protocol as the web app. The GWT magic values (permutation hash, header)
+may change when Cronometer deploys new builds. See README for details.
+"""
+
+import csv
+import io
+import json
+import logging
+import os
+import pickle
+import re
+from datetime import date
+from pathlib import Path
+
+import requests
+from requests.cookies import CookieConflictError
+
+logger = logging.getLogger(__name__)
+
+# URLs
+LOGIN_HTML_URL = "https://cronometer.com/login/"
+LOGIN_API_URL = "https://cronometer.com/login"
+GWT_BASE_URL = "https://cronometer.com/cronometer/app"
+EXPORT_URL = "https://cronometer.com/export"
+
+# Food search moved off GWT-RPC to a REST JSON API (observed 2026-08-19).
+# The old findFoods RPC no longer exists: its FoodSearchTabSelection
+# parameter type was removed from Cronometer's serialization policy, so
+# calling it returns IncompatibleRemoteServiceException.
+FOOD_SEARCH_URL = "https://cronometer.com/api/v3/user/{user_id}/food-search/string"
+GWT_NOCACHE_JS_URL = "https://cronometer.com/cronometer/cronometer.nocache.js"
+GWT_CACHE_JS_URL = "https://cronometer.com/cronometer/{permutation}.cache.js"
+
+# NCCDB "universal" measure_id that works for any food in updateDiary.
+# CRDB foods have food-specific measure_ids in their getFood response,
+# but those IDs cause "ghost entries" (counted but invisible in diary).
+# Using an NCCDB measure_id (here: eggs' "mL chopped" measure) with the
+# correct weight_grams produces working entries for ALL food sources.
+UNIVERSAL_MEASURE_ID = 124399
+
+# Cronometer Gold exposes 8 diary group slots, settings keys DG01-DG08.
+# Cronometer has a public request open to raise this; derive ranges from
+# what is actually parsed rather than hardcoding 8 in more places.
+DIARY_GROUP_SLOTS = 8
+
+# GWT magic values — used as fallbacks if auto-discovery fails.
+DEFAULT_GWT_CONTENT_TYPE = "text/x-gwt-rpc; charset=UTF-8"
+DEFAULT_GWT_MODULE_BASE = "https://cronometer.com/cronometer/"
+DEFAULT_GWT_PERMUTATION = "CBC38FBB0A1527BD5E68722DD9DABD27"
+DEFAULT_GWT_HEADER = "76FC4464E20E53D16663AC9A96A486B3"
+
+GWT_AUTHENTICATE = (
+    "7|0|5|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "authenticate|java.lang.Integer/3438268394|"
+    "1|2|3|4|1|5|5|-300|"
+)
+
+GWT_GENERATE_AUTH_TOKEN = (
+    "7|0|8|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "generateAuthorizationToken|java.lang.String/2004016611|"
+    "I|com.cronometer.shared.user.AuthScope/2065601159|"
+    "{nonce}|1|2|3|4|4|5|6|6|7|8|{user_id}|3600|7|2|"
+)
+
+# DEAD: Cronometer removed the findFoods RPC (see FOOD_SEARCH_URL above).
+# Kept for reference only - nothing calls this. Safe to delete.
+GWT_FIND_FOODS = (
+    "7|0|12|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "findFoods|java.lang.String/2004016611|"
+    "I|[Lcom.cronometer.shared.foods.FoodSource;/3597302983|"
+    "com.cronometer.shared.foods.FoodSearchTabSelection/1776179901|"
+    "Z|{nonce}|{query}|"
+    "com.cronometer.shared.foods.FoodSource/4236433762|"
+    "1|2|3|4|8|5|5|6|7|6|5|8|9|10|11|{max_results}|7|1|12|0|0|0|8|0|0|"
+)
+
+GWT_UPDATE_DIARY = (
+    "7|0|12|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "updateDiary|java.lang.String/2004016611|"
+    "I|java.util.List|{nonce}|"
+    "java.util.Collections$SingletonList/1586180994|"
+    "com.cronometer.shared.entries.changes.AddEntryChange/3949104564|"
+    "com.cronometer.shared.entries.models.Serving/2895043750|"
+    "com.cronometer.shared.entries.models.Day/782579793|"
+    "1|2|3|4|3|5|6|7|8|{user_id}|9|10|1|1|11|12|"
+    "{day}|{month}|{year}|{quantity}|{diary_group}|0|{measure_id}|0|0|"
+    "{weight_grams}|{food_source_id}|A|{food_id}|0|"
+)
+
+GWT_REMOVE_SERVING = (
+    "7|0|8|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "removeServing|java.lang.String/2004016611|"
+    "J|I|{nonce}|1|2|3|4|3|5|6|7|8|{serving_id}|{user_id}|"
+)
+
+# Captured from the web app deleting a note (Nov 2026): the note id is a
+# GWT-encoded long, like removeServing's serving id.
+GWT_REMOVE_NOTE = (
+    "7|0|8|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "removeNote|java.lang.String/2004016611|"
+    "J|I|{nonce}|1|2|3|4|3|5|6|7|8|{note_id}|{user_id}|"
+)
+
+_GWT_LONG_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789$_"
+
+
+def gwt_long(value: int) -> str:
+    """Encode a Java long the way GWT-RPC writes one: base 64, high digits first."""
+    if value < 0:
+        raise ValueError("negative ids are not used")
+    out = ""
+    while True:
+        out = _GWT_LONG_ALPHABET[value & 63] + out
+        value >>= 6
+        if not value:
+            return out
+
+
+GWT_GET_FOOD = (
+    "7|0|7|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "getFood|java.lang.String/2004016611|"
+    "I|{nonce}|"
+    "1|2|3|4|2|5|6|7|{food_source_id}|"
+)
+
+GWT_GET_ALL_MACRO_SCHEDULES = (
+    "7|0|7|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "getAllMacroSchedules|java.lang.String/2004016611|"
+    "I|{nonce}|"
+    "1|2|3|4|2|5|6|7|{user_id}|"
+)
+
+GWT_GET_DAILY_MACRO_TARGET_TEMPLATE = (
+    "7|0|8|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "getDailyMacroTargetTemplate|java.lang.String/2004016611|"
+    "I|com.cronometer.shared.entries.models.Day/782579793|"
+    "{nonce}|"
+    "1|2|3|4|3|5|6|7|8|{user_id}|7|{day}|{month}|{year}|"
+)
+
+GWT_UPDATE_DAILY_TARGET_TEMPLATE = (
+    "7|0|12|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "updateDailyTargetTemplate|java.lang.String/2004016611|"
+    "I|com.cronometer.shared.targets.models.MacroTargetTemplate/3691130822|"
+    "{nonce}|"
+    "java.lang.Boolean/476441737|"
+    "java.lang.Double/858496421|"
+    "com.cronometer.shared.entries.models.Day/782579793|"
+    "{template_name}|"
+    "1|2|3|4|3|5|6|7|8|{user_id}|"
+    "7|9|0|10|{carbs}|0|11|{day}|{month}|{year}|"
+    "10|{calories}|10|{fat}|0|1|0|0|0|12|10|{protein}|0|"
+)
+
+GWT_GET_MACRO_TARGET_TEMPLATES = (
+    "7|0|7|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "getMacroTargetTemplates|java.lang.String/2004016611|"
+    "I|{nonce}|"
+    "1|2|3|4|2|5|6|7|{user_id}|"
+)
+
+GWT_SAVE_MACRO_SCHEDULE = (
+    "7|0|9|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "saveMacroSchedule|java.lang.String/2004016611|"
+    "I|com.cronometer.shared.targets.DayOfWeek/913617675|"
+    "{nonce}|"
+    "com.cronometer.shared.targets.DayOfWeek$DayOfWeekEnum/3974900421|"
+    "1|2|3|4|4|5|6|7|6|8|{user_id}|7|9|{day_of_week}|{template_id}|"
+)
+
+GWT_DELETE_MACRO_TARGET_TEMPLATE = (
+    "7|0|7|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "deleteMacroTargetTemplate|java.lang.String/2004016611|"
+    "I|{nonce}|"
+    "1|2|3|4|3|5|6|6|7|{user_id}|{template_id}|"
+)
+
+# --- Biometric GWT templates ---
+
+GWT_GET_RECENT_BIOMETRICS = (
+    "7|0|7|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "getRecentBiometrics|java.lang.String/2004016611|"
+    "I|{nonce}|"
+    "1|2|3|4|2|5|6|7|{user_id}|"
+)
+
+GWT_ADD_BIOMETRIC = (
+    "7|0|9|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "addBiometric|java.lang.String/2004016611|"
+    "com.cronometer.shared.biometrics.Biometric/2989635787|"
+    "I|{nonce}|"
+    "com.cronometer.shared.entries.models.Day/782579793|"
+    "1|2|3|4|3|5|6|7|8|6|"
+    "{value}|9|{day}|{month}|{year}|0|A|0|1|0|{flags}|"
+    "0|0|0|0|0|{metric_position}|0|{user_id}|"
+)
+
+GWT_REMOVE_MEASUREMENT = (
+    "7|0|8|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "removeMeasurement|java.lang.String/2004016611|"
+    "J|I|{nonce}|"
+    "1|2|3|4|3|5|6|7|8|{biometric_id}|{user_id}|"
+)
+
+# Known biometric metric types and their addBiometric flags/position
+# flags encodes metric type + unit preferences
+# metric_position is the position in the Biometric object structure
+_BIOMETRIC_TYPES = {
+    "weight": {"flags": 65539, "metric_position": 2, "unit": "lbs"},
+    "blood_glucose": {"flags": 196609, "metric_position": 2, "unit": "mg/dL"},
+    "heart_rate": {"flags": 65540, "metric_position": 2, "unit": "bpm"},
+    "body_fat": {"flags": 65539, "metric_position": 2, "unit": "%"},
+}
+
+# --- Fasting GWT templates ---
+
+GWT_GET_USER_FASTS = (
+    "7|0|7|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "getUserFasts|java.lang.String/2004016611|"
+    "I|{nonce}|"
+    "1|2|3|4|2|5|6|7|{user_id}|"
+)
+
+GWT_GET_USER_FASTS_FOR_RANGE = (
+    "7|0|8|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "getUserFastsForRange|java.lang.String/2004016611|"
+    "I|com.cronometer.shared.entries.models.Day/782579793|"
+    "{nonce}|"
+    "1|2|3|4|4|5|6|7|7|8|{user_id}|"
+    "7|{start_day}|{start_month}|{start_year}|"
+    "7|{end_day}|{end_month}|{end_year}|"
+)
+
+GWT_GET_FASTING_STATS = (
+    "7|0|7|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "getFastingStats|java.lang.String/2004016611|"
+    "I|{nonce}|"
+    "1|2|3|4|2|5|6|7|{user_id}|"
+)
+
+GWT_DELETE_FAST = (
+    "7|0|8|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "deleteFast|java.lang.String/2004016611|"
+    "I|java.lang.Integer/3438268394|"
+    "{nonce}|"
+    "1|2|3|4|4|5|6|6|7|8|{user_id}|{fast_id}|0|"
+)
+
+GWT_CANCEL_FAST_KEEP_SERIES = (
+    "7|0|7|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "cancelFastAndKeepSeries|java.lang.String/2004016611|"
+    "I|{nonce}|"
+    "1|2|3|4|3|5|6|6|7|{user_id}|{fast_id}|"
+)
+
+# --- Diary operations GWT templates ---
+
+GWT_COPY_DAY = (
+    "7|0|8|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "copyDay|java.lang.String/2004016611|"
+    "I|com.cronometer.shared.entries.models.Day/782579793|"
+    "{nonce}|"
+    "1|2|3|4|4|5|6|7|7|8|{user_id}|"
+    "7|{src_day}|{src_month}|{src_year}|"
+    "7|{dst_day}|{dst_month}|{dst_year}|"
+)
+
+GWT_SET_DAY_COMPLETE = (
+    "7|0|9|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "setDayComplete|java.lang.String/2004016611|"
+    "I|com.cronometer.shared.entries.models.Day/782579793|"
+    "java.lang.Boolean/476441737|"
+    "{nonce}|"
+    "1|2|3|4|4|5|6|7|8|9|{user_id}|"
+    "7|{day}|{month}|{year}|{complete}|"
+)
+
+# --- Repeat item GWT templates ---
+
+GWT_GET_REPEATED_ITEMS = (
+    "7|0|7|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "getRepeatedItems|java.lang.String/2004016611|"
+    "I|{nonce}|"
+    "1|2|3|4|2|5|6|7|{user_id}|"
+)
+
+GWT_ADD_REPEAT_ITEM = (
+    "7|0|11|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "addRepeatItem|java.lang.String/2004016611|"
+    "I|com.cronometer.shared.repeatitems.RepeatItem/477684891|"
+    "{nonce}|"
+    "java.util.ArrayList/4159755760|"
+    "java.lang.Integer/3438268394|"
+    "{food_name}|"
+    "1|2|3|4|3|5|6|7|8|{user_id}|7|{quantity}|"
+    "9|{day_count}|{day_entries}|"
+    "0|11|{diary_group}|0|{food_source_id}|{food_id}|0|"
+)
+
+GWT_DELETE_REPEAT_ITEM = (
+    "7|0|7|https://cronometer.com/cronometer/|"
+    "{gwt_header}|"
+    "com.cronometer.shared.rpc.CronometerService|"
+    "deleteRepeatItem|java.lang.String/2004016611|"
+    "I|{nonce}|"
+    "1|2|3|4|3|5|6|6|7|{user_id}|{repeat_item_id}|"
+)
+
+# US ordering (getAllMacroSchedules) to ISO ordering (saveMacroSchedule)
+# getAllMacroSchedules: 0=Sun, 1=Mon, ..., 6=Sat
+# saveMacroSchedule:   0=Mon, 1=Tue, ..., 6=Sun
+_US_TO_ISO_DOW = {0: 6, 1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5}
+
+EXPORT_TYPES = {
+    "servings": "servings",
+    "daily_summary": "dailySummary",
+    "exercises": "exercises",
+    "biometrics": "biometrics",
+    "notes": "notes",
+}
+
+
+# (connect, read) seconds. Tool calls run one at a time (see server.py), so a
+# request that never returns would otherwise block every other tool.
+REQUEST_TIMEOUT = (10, 60)
+
+
+class SessionExpiredError(RuntimeError):
+    """Cronometer rejected the session (expired or logged out server-side)."""
+
+
+class _GwtReader:
+    """Read a GWT-RPC //OK response object by object, the way GWT does.
+
+    Tokens are consumed from the end. An object is a type ref (1-based into
+    the string table) followed by its fields, a negative back-reference to an
+    object already read, or a bare 0 for null. Only the types the macro target
+    responses use are known; anything else raises rather than guessing.
+
+    Position-based parsing broke on real data: an unset macro is a null, so
+    "the first four floats" shifted or came up short (issue #5).
+    """
+
+    def __init__(self, raw: str):
+        self.raw = raw
+        if not raw.startswith("//OK[") or not raw.endswith(",0,7]"):
+            self.fail("not a GWT-RPC success response")
+        self.strings = CronometerWebClient._extract_gwt_string_table(raw)
+        self.tokens = CronometerWebClient._tokenize_gwt_data(raw, self.strings)
+        self.seen: list = []
+
+    def fail(self, why: str):
+        raise ValueError(f"Could not parse GWT response ({why}): {self.raw[:300]}")
+
+    def next(self):
+        if not self.tokens:
+            self.fail("ran out of tokens")
+        return self.tokens.pop()
+
+    def string(self) -> str | None:
+        ref = self.next()
+        return self.strings[ref - 1] if ref else None
+
+    def object(self):
+        ref = self.next()
+        if ref == 0:
+            return None
+        if ref < 0:
+            return self.seen[-ref - 1]
+        if not isinstance(ref, int) or ref > len(self.strings):
+            self.fail(f"bad type ref {ref!r}")
+        slot = len(self.seen)
+        self.seen.append(None)
+        self.seen[slot] = self._read(self.strings[ref - 1].split("/")[0])
+        return self.seen[slot]
+
+    def done(self) -> None:
+        if self.tokens:
+            self.fail(f"{len(self.tokens)} unread tokens")
+
+    def _read(self, type_name: str):
+        short = type_name.rsplit(".", 1)[-1]
+        if type_name in ("java.lang.Boolean", "java.lang.Integer") or short.endswith("Enum"):
+            return int(self.next())
+        if type_name == "java.lang.Double":
+            return float(self.next())
+        if type_name == "java.util.ArrayList":
+            return [self.object() for _ in range(self.next())]
+        if short == "Day":
+            day, month, year = self.next(), self.next(), self.next()
+            return date(year, month, day)
+        if short == "DayOfWeek":
+            return self.object()
+        if short == "MacroSchedule":
+            return {"day_of_week": self.object(), "template": self.object()}
+        if short == "MacroTargetTemplate":
+            return self._macro_target_template()
+        self.fail(f"unexpected type {type_name}")
+
+    def _macro_target_template(self) -> dict:
+        # Field order cross-checked against the saveMacroTargetTemplate payload
+        # and five live templates. Unnamed fields are always null/0 in practice.
+        self.object()                       # Boolean flag
+        carbs = self.object()
+        self.object()                       # Double, unused
+        self.object()                       # Day (daily targets only)
+        calories = self.object()
+        fat = self.object()
+        self.object()                       # Double, unused
+        self.next()                         # int flag
+        template_id = self.object()
+        self.string()                       # program, e.g. "Rigorous"
+        self.next()                         # int
+        name = self.string()
+        protein = self.object()
+        self.object()                       # Double, unused
+        return {
+            "template_id": template_id or 0,
+            "template_name": name or "",
+            "protein_g": protein,
+            "fat_g": fat,
+            "calories": calories,
+            "carbs_g": carbs,
+        }
+
+
+class CronometerWebClient:
+    """Client for the Cronometer GWT-RPC API.
+
+    Credentials are read from CRONOMETER_USERNAME and CRONOMETER_PASSWORD
+    environment variables, or can be passed directly.
+    """
+
+    def __init__(
+        self,
+        username: str | None = None,
+        password: str | None = None,
+        gwt_permutation: str | None = None,
+        gwt_header: str | None = None,
+    ):
+        self.username = username or os.environ.get("CRONOMETER_USERNAME", "")
+        self.password = password or os.environ.get("CRONOMETER_PASSWORD", "")
+        self.gwt_permutation = gwt_permutation or DEFAULT_GWT_PERMUTATION
+        self.gwt_header = gwt_header or DEFAULT_GWT_HEADER
+
+        if not self.username or not self.password:
+            raise ValueError(
+                "Cronometer credentials required. Set CRONOMETER_USERNAME and "
+                "CRONOMETER_PASSWORD environment variables, or pass them directly."
+            )
+
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0 Safari/537.36"})
+        self.nonce: str | None = None
+        self.user_id: str | None = None
+        self._authenticated = False
+        self._diary_groups: list[dict] | None = None
+        self._cookie_path = Path(
+            os.environ.get("CRONOMETER_DATA_DIR", Path.home() / ".local" / "share" / "cronometer-mcp")
+        ) / ".session_cookies"
+
+    def _get_anticsrf(self) -> str:
+        """Step 1: Fetch the login page and extract the anti-CSRF token."""
+        resp = self.session.get(LOGIN_HTML_URL, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        match = re.search(r'name="anticsrf"\s+value="([^"]+)"', resp.text)
+        if not match:
+            raise RuntimeError("Could not find anti-CSRF token on login page")
+        return match.group(1)
+
+    def _login(self, anticsrf: str) -> None:
+        """Step 2: POST credentials to the login endpoint."""
+        resp = self.session.post(
+            LOGIN_API_URL,
+            data={
+                "anticsrf": anticsrf,
+                "username": self.username,
+                "password": self.password,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("error"):
+            raise RuntimeError(f"Login failed: {result['error']}")
+        if not (result.get("success") or result.get("redirect")):
+            raise RuntimeError(f"Login failed: unexpected response {result}")
+
+        # Extract sesnonce cookie
+        self.nonce = self._cookie_value("sesnonce")
+        if not self.nonce:
+            raise RuntimeError("Login succeeded but no sesnonce cookie received")
+        logger.info("Login successful")
+
+    def _discover_gwt_hashes(self) -> None:
+        """Discover current GWT permutation and header hashes.
+
+        Fetches the GWT bootstrap JS to get the permutation hash, then
+        fetches the compiled cache.js to extract the serialization policy
+        hash (GWT header) for the 'app' endpoint.
+
+        Falls back to the hardcoded defaults if discovery fails.
+        """
+        try:
+            # Step 1: Get permutation hash from nocache.js
+            resp = self.session.get(GWT_NOCACHE_JS_URL, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            perm_match = re.search(r"='([A-F0-9]{32})'", resp.text)
+            if not perm_match:
+                logger.warning("Could not extract permutation hash; using default")
+                return
+            permutation = perm_match.group(1)
+
+            # Step 2: Get GWT header from the compiled cache.js
+            cache_url = GWT_CACHE_JS_URL.replace("{permutation}", permutation)
+            resp = self.session.get(cache_url, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            # The 'app' endpoint hash appears as: 'app','<32-HEX>'
+            header_match = re.search(
+                r"'app','([A-F0-9]{32})'", resp.text
+            )
+            if not header_match:
+                logger.warning(
+                    "Could not extract GWT header from cache.js; using default"
+                )
+                # Still update permutation even if header extraction fails
+                self.gwt_permutation = permutation
+                return
+
+            self.gwt_permutation = permutation
+            self.gwt_header = header_match.group(1)
+            logger.info(
+                "GWT hashes discovered: permutation=%s, header=%s",
+                self.gwt_permutation,
+                self.gwt_header,
+            )
+        except Exception:
+            logger.warning(
+                "GWT hash discovery failed; using defaults", exc_info=True
+            )
+
+    def _gwt_authenticate(self) -> None:
+        """Step 3: GWT authentication to get user ID."""
+        body = GWT_AUTHENTICATE.replace("{gwt_header}", self.gwt_header)
+        resp = self.session.post(
+            GWT_BASE_URL,
+            data=body,
+            headers={
+                "content-type": DEFAULT_GWT_CONTENT_TYPE,
+                "x-gwt-module-base": DEFAULT_GWT_MODULE_BASE,
+                "x-gwt-permutation": self.gwt_permutation,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+
+        match = re.search(r"OK\[(\d+),", resp.text)
+        if not match:
+            raise RuntimeError(
+                f"GWT authenticate failed to extract user ID. "
+                f"Response: {resp.text[:200]}"
+            )
+        self.user_id = match.group(1)
+
+        # The settings map in this same response carries the user's diary
+        # groups. Parse it here so the fresh-login path costs no extra call.
+        self._diary_groups = self._parse_diary_groups(resp.text)
+
+        # Update nonce from cookies
+        new_nonce = self._cookie_value("sesnonce")
+        if new_nonce:
+            self.nonce = new_nonce
+        logger.info("GWT auth successful, user_id=%s", self.user_id)
+
+    def _generate_auth_token(self) -> str:
+        """Step 4: Generate a short-lived auth token for export requests."""
+        body = GWT_GENERATE_AUTH_TOKEN.replace("{gwt_header}", self.gwt_header)
+        body = body.replace("{nonce}", self.nonce or "")
+        body = body.replace("{user_id}", self.user_id or "")
+
+        resp = self.session.post(
+            GWT_BASE_URL,
+            data=body,
+            headers={
+                "content-type": DEFAULT_GWT_CONTENT_TYPE,
+                "x-gwt-module-base": DEFAULT_GWT_MODULE_BASE,
+                "x-gwt-permutation": self.gwt_permutation,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+
+        # A dead session still returns HTTP 200, with a GWT exception payload:
+        #   //EX[2,1,["...NotLoggedInException/844385496","Invalid or expired
+        #   session"],0,7]
+        # The regex below would happily extract the exception class name as the
+        # "token", so _restore_session() would treat a dead session as valid and
+        # every later export would 403. Reject //EX before parsing.
+        if resp.text.lstrip().startswith("//EX"):
+            raise SessionExpiredError(
+                f"Session rejected while generating auth token: {resp.text[:200]}"
+            )
+
+        match = re.search(r'"([^"]+)"', resp.text)
+        if not match:
+            raise RuntimeError(
+                f"Failed to extract auth token. Response: {resp.text[:200]}"
+            )
+        token = match.group(1)
+        logger.info("Auth token generated")
+        return token
+
+    def _cookie_value(self, name: str) -> str | None:
+        """Read a cookie, tolerating duplicates.
+
+        _save_session() flattens the jar with get_dict(), which drops the
+        domain, so _restore_session() re-adds cookies with domain "". Once the
+        server then sets its own domain-scoped copy, the jar holds two cookies
+        of the same name and requests' cookies.get() raises
+        CookieConflictError.
+
+        That mattered: the raise aborted the session-nonce refresh, leaving a
+        stale nonce behind, and every later GWT call failed with
+        NotLoggedInException. Prefer the most recently set value.
+        """
+        try:
+            value = self.session.cookies.get(name)
+        except CookieConflictError:
+            value = None
+        if value is not None:
+            return value
+        values = [c.value for c in self.session.cookies if c.name == name]
+        return values[-1] if values else None
+
+    def _save_session(self) -> None:
+        """Persist session cookies and auth state to disk."""
+        self._cookie_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "cookies": self.session.cookies.get_dict(),
+            "nonce": self.nonce,
+            "user_id": self.user_id,
+            "gwt_permutation": self.gwt_permutation,
+            "gwt_header": self.gwt_header,
+        }
+        self._cookie_path.write_bytes(pickle.dumps(data))
+        logger.debug("Session saved to %s", self._cookie_path)
+
+    def _restore_session(self) -> bool:
+        """Try to restore a previous session from disk. Returns True if valid."""
+        if not self._cookie_path.exists():
+            return False
+        try:
+            data = pickle.loads(self._cookie_path.read_bytes())
+            for k, v in data["cookies"].items():
+                self.session.cookies.set(k, v)
+            self.nonce = data["nonce"]
+            self.user_id = data["user_id"]
+            self.gwt_permutation = data.get("gwt_permutation", self.gwt_permutation)
+            self.gwt_header = data.get("gwt_header", self.gwt_header)
+            # Validate with a lightweight GWT call (generateAuthToken)
+            self._discover_gwt_hashes()
+            token = self._generate_auth_token()
+            if token:
+                logger.info("Restored saved session")
+                return True
+        except Exception:
+            pass
+
+        self._discard_session()
+        return False
+
+    def _discard_session(self) -> None:
+        """Forget a dead session: cookies, auth state and the saved pickle.
+
+        Drop the dead cookies as well as the pickle. Leaving them on the
+        session poisons the fresh login that follows: Cronometer serves
+        /login/ differently to a request carrying a stale session cookie, and
+        the anti-CSRF token is missing from that variant.
+        """
+        self.session.cookies.clear()
+        self.nonce = None
+        self.user_id = None
+        self._diary_groups = None
+        self._cookie_path.unlink(missing_ok=True)
+
+    def _reauthenticate(self) -> None:
+        """Replace a session that died mid-process with a fresh login.
+
+        authenticate() caches success for the life of the process, so without
+        this a session expiring server-side breaks every call until restart.
+        """
+        logger.info("Session expired; logging in again")
+        self._authenticated = False
+        self._discard_session()
+        self.authenticate()
+
+    def authenticate(self) -> None:
+        """Full authentication flow: discover hashes, login, GWT auth."""
+        if self._authenticated:
+            return
+        if self._restore_session():
+            self._authenticated = True
+            return
+        self._discover_gwt_hashes()
+        anticsrf = self._get_anticsrf()
+        self._login(anticsrf)
+        self._gwt_authenticate()
+        self._authenticated = True
+        self._save_session()
+
+    def export_raw(
+        self,
+        export_type: str,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> str:
+        """Export raw CSV data from Cronometer.
+
+        Args:
+            export_type: One of 'servings', 'daily_summary', 'exercises',
+                        'biometrics', 'notes'.
+            start: Start date (defaults to today).
+            end: End date (defaults to today).
+
+        Returns:
+            Raw CSV text.
+        """
+        self.authenticate()
+        try:
+            token = self._generate_auth_token()
+        except SessionExpiredError:
+            self._reauthenticate()
+            token = self._generate_auth_token()
+
+        if start is None:
+            start = date.today()
+        if end is None:
+            end = date.today()
+
+        generate_value = EXPORT_TYPES.get(export_type, export_type)
+
+        resp = self.session.get(
+            EXPORT_URL,
+            params={
+                "nonce": token,
+                "generate": generate_value,
+                "start": start.strftime("%Y-%m-%d"),
+                "end": end.strftime("%Y-%m-%d"),
+            },
+            headers={
+                "sec-fetch-dest": "document",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-site": "same-origin",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        # The export is UTF-8 but sent without a charset, so requests would
+        # guess Latin-1 and turn "µg" into "Âµg".
+        resp.encoding = "utf-8"
+        return resp.text
+
+    def export_parsed(
+        self,
+        export_type: str,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> list[dict]:
+        """Export and parse CSV data into a list of dicts.
+
+        Args:
+            export_type: One of 'servings', 'daily_summary', 'exercises',
+                        'biometrics', 'notes'.
+            start: Start date (defaults to today).
+            end: End date (defaults to today).
+
+        Returns:
+            List of dicts, one per CSV row.
+        """
+        raw = self.export_raw(export_type, start, end)
+        reader = csv.DictReader(io.StringIO(raw))
+        return list(reader)
+
+    def _gwt_post(self, body: str) -> str:
+        """POST a GWT-RPC payload and return the raw response text.
+
+        Raises RuntimeError if the response does not start with '//OK'.
+        A NotLoggedInException triggers one fresh login and one retry. Callers
+        bake self.nonce into the body, so the retry swaps in the new nonce;
+        resending the dead one would just be rejected again. The nonce is its
+        own pipe-delimited field, so match it whole: user text (a template
+        name, say) may not be rewritten.
+        """
+        sent_nonce = self.nonce
+        for attempt in range(2):
+            resp = self.session.post(
+                GWT_BASE_URL,
+                data=body,
+                headers={
+                    "content-type": DEFAULT_GWT_CONTENT_TYPE,
+                    "x-gwt-module-base": DEFAULT_GWT_MODULE_BASE,
+                    "x-gwt-permutation": self.gwt_permutation,
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            if resp.text.startswith("//OK"):
+                return resp.text
+            if attempt or "NotLoggedInException" not in resp.text:
+                break
+            self._reauthenticate()
+            if sent_nonce:
+                body = body.replace(f"|{sent_nonce}|", f"|{self.nonce}|", 1)
+        raise RuntimeError(
+            f"GWT-RPC call failed. Response: {resp.text[:300]}"
+        )
+
+    @staticmethod
+    def _parse_find_foods(raw: str) -> list[dict]:
+        """DEAD: parser for the removed findFoods RPC. Nothing calls this.
+
+        Retained only because it documents the GWT string-table decoding
+        approach. Food search now goes through FOOD_SEARCH_URL.
+        """
+        """Parse a GWT-RPC findFoods response into structured food records.
+
+        The GWT-RPC wire format encodes all strings in a string table at the
+        end of the response; the data section contains integer tokens that
+        reference that table by 1-based index.  Each SearchHit occupies a
+        fixed-width slot in the token stream:
+
+            score, flags, name_ref, food_id, measure_desc_ref, locale_ref,
+            food_source_id, popularity, keywords_ref, <SearchHit type ref>
+
+        We locate every occurrence of the SearchHit type-index value in the
+        token list and read the nine tokens that precede it.
+
+        Args:
+            raw: Raw ``//OK[...]`` GWT-RPC response string.
+
+        Returns:
+            List of dicts with keys ``food_id``, ``food_source_id``, ``name``,
+            ``measure_desc``, and ``score``.  Returns an empty list when the
+            response contains no results or cannot be parsed.
+
+        Raises:
+            ValueError: If the response does not match the expected GWT-RPC
+                        envelope format.
+
+        Example::
+
+            results = CronometerWebClient._parse_find_foods(raw_gwt_response)
+            # [{"food_id": 1072102, "food_source_id": 464674,
+            #   "name": "Egg, whole, cooked, hard-boiled",
+            #   "measure_desc": "1 large - 50g", "score": 100}, ...]
+        """
+        raw = raw.strip()
+        if not raw.startswith("//OK["):
+            raise ValueError(
+                f"Unexpected GWT-RPC response format: {raw[:100]!r}"
+            )
+
+        # The response ends with ],0,7] — the ']' closes the embedded string
+        # table array, then ',0,7]' closes the outer //OK[ envelope.
+        closing = ",0,7]"
+        if not raw.endswith(closing):
+            raise ValueError(
+                f"Response does not end with expected closing ',0,7]': "
+                f"{raw[-40:]!r}"
+            )
+
+        # Locate the string table JSON array by scanning backwards from the
+        # ']' that closes it (immediately before ',0,7]').
+        # Must skip brackets inside quoted strings (e.g. Java array type
+        # descriptors like "[Lcom.cronometer...").
+        st_close = len(raw) - len(closing) - 1  # index of ']' closing str table
+        depth = 1
+        pos = st_close - 1
+        in_string = False
+        while pos >= 0 and depth > 0:
+            ch = raw[pos]
+            if ch == '"' and (pos == 0 or raw[pos - 1] != "\\"):
+                in_string = not in_string
+            elif not in_string:
+                if ch == "]":
+                    depth += 1
+                elif ch == "[":
+                    depth -= 1
+            pos -= 1
+        st_open = pos + 1  # index of '[' opening the string table
+
+        string_table: list[str] = json.loads(raw[st_open : st_close + 1])
+
+        # Find the 1-based indices of key classes in the string table.
+        searchhit_type_idx: int | None = None
+        foodsource_type_idx: int | None = None
+        foodtype_type_idx: int | None = None
+        for idx, entry in enumerate(string_table):
+            # Skip Java array type descriptors (e.g. "[Lcom.cronometer...;/...")
+            # — we only want the actual class, not the array-of-class type.
+            if entry.startswith("["):
+                continue
+            if "SearchHit" in entry and searchhit_type_idx is None:
+                searchhit_type_idx = idx + 1  # GWT uses 1-based references
+            elif "FoodSource" in entry and foodsource_type_idx is None:
+                foodsource_type_idx = idx + 1
+            elif "FoodType" in entry and foodtype_type_idx is None:
+                foodtype_type_idx = idx + 1
+
+        if searchhit_type_idx is None:
+            # No SearchHit class in the string table → zero results.
+            return []
+
+        # Helper: resolve a 1-based string table reference to its string value.
+        def _resolve(ref: int) -> str | None:
+            if 1 <= ref <= len(string_table):
+                return string_table[ref - 1]
+            return None
+
+        # Tokenise the data section (between '//OK[' and the string table).
+        # All tokens in a findFoods data section are plain integers.
+        # '//OK[' is 5 characters, so data starts at index 5.
+        data_section = raw[5:st_open].rstrip(",")
+        if not data_section:
+            return []
+
+        tokens: list[int] = []
+        for part in data_section.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                tokens.append(int(part))
+            except ValueError:
+                # Unexpected non-integer token; insert a sentinel that will
+                # never match a valid type index so scanning continues safely.
+                tokens.append(-(10 ** 9))
+
+        # Scan for SearchHit type-index occurrences.
+        # Each hit has exactly 9 fields before the type ref:
+        #
+        #   i-9  score          (relevance, e.g. 1918)
+        #   i-8  flags          (always 0)
+        #   i-7  name_ref       (1-based string table index)
+        #   i-6  food_id        (raw integer, e.g. 1072101)
+        #   i-5  measure_desc_ref (1-based string table index)
+        #   i-4  locale_ref     (1-based string table index, e.g. → "en")
+        #   i-3  food_source_id (raw integer, e.g. 464674)
+        #   i-2  popularity     (usage count, not returned to caller)
+        #   i-1  keywords_ref   (1-based string table index, not returned)
+        #   i    <SearchHit type ref>
+        #
+        # FoodSource/FoodType enum data appears in separate token blocks
+        # between SearchHit records, NOT immediately after the type ref.
+        results: list[dict] = []
+        for i, token in enumerate(tokens):
+            if token != searchhit_type_idx:
+                continue
+            if i < 9:
+                continue
+
+            score = tokens[i - 9]
+            # tokens[i - 8] is flags (always 0; not validated here)
+            name_ref = tokens[i - 7]
+            food_id = tokens[i - 6]
+            measure_desc_ref = tokens[i - 5]
+            # tokens[i - 4] is locale_ref (not returned)
+            food_source_id = tokens[i - 3]
+            # tokens[i - 2] is popularity (not returned)
+            # tokens[i - 1] is keywords_ref (not returned)
+
+            name = _resolve(name_ref)
+            if name is None:
+                continue
+            # Skip refs that resolve to GWT class descriptors (e.g.
+            # "com.cronometer...", "java.util...", "[Lcom...") — indicates a
+            # false positive where a stray integer matched the type index.
+            if "/" in name and ("." in name.split("/")[0]):
+                continue
+
+            measure_desc = _resolve(measure_desc_ref) or ""
+
+            results.append(
+                {
+                    "food_id": food_id,
+                    "food_source_id": food_source_id,
+                    "name": name,
+                    "measure_desc": measure_desc,
+                    "score": score,
+                }
+            )
+
+        return results
+
+    def find_foods(self, query: str, max_results: int = 50) -> list[dict]:
+        """Search Cronometer's food database via the REST food-search API.
+
+        Backed by FOOD_SEARCH_URL, not GWT-RPC: Cronometer removed the findFoods
+        RPC, so the old pipe-delimited path can no longer work.
+
+        Args:
+            query: Search term.  The Cronometer web app uppercases queries
+                   before sending; this method does the same automatically.
+            max_results: Maximum number of results to return (default 50).
+                         The web app uses 50 for typeahead, 250 for a full
+                         search.
+
+        Returns:
+            List of dicts, each with keys:
+
+            - ``food_id`` (int): Numeric food identifier. Pass to add_serving.
+            - ``food_source_id`` (int): Source database identifier. Pass to
+              add_serving and get_food.
+            - ``name`` (str): Food name as stored in Cronometer.
+            - ``measure_desc`` (str): Default measure description
+              (e.g. ``"1 large - 50g"``).
+            - ``score`` (int): Relevance score from the search engine.
+            - ``source`` (str): Origin database (``NCCDB``, ``USDA``, ``CRDB``,
+              ``FDCBranded``, ...). Useful for picking a canonical entry when
+              several databases carry the same food.
+            - ``type`` (str): ``FOOD``, ``RECIPE`` or similar.
+
+            Unlike the old RPC, this returns both ids, so a follow-up get_food()
+            call is no longer needed just to resolve food_id.
+        """
+        self.authenticate()
+        for attempt in range(2):
+            resp = self.session.get(
+                FOOD_SEARCH_URL.format(user_id=self.user_id),
+                params={
+                    "query": query.upper(),
+                    "maxResults": max_results,
+                    "sources": "All",
+                    "categoryId": 0,
+                    "selectedTab": "ALL",
+                    "type": "All",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.status_code in (401, 403) and not attempt:
+                self._reauthenticate()
+                continue
+            resp.raise_for_status()
+            return [self._map_search_hit(hit) for hit in resp.json()]
+
+    @staticmethod
+    def _map_search_hit(hit: dict) -> dict:
+        """Map one REST food-search hit onto the find_foods() contract.
+
+        Careful with the id fields: the REST payload's ``measureId`` is what the
+        rest of this client calls ``food_id``, and its ``id`` is
+        ``food_source_id``. Verified against a known food (Safe Catch tuna =
+        food_source_id 24272784 / food_id 66395420). Taking ``measureId`` to be
+        a measure id would silently produce unusable diary entries.
+        """
+        return {
+            "food_id": hit.get("measureId"),
+            "food_source_id": hit.get("id"),
+            "name": hit.get("name", ""),
+            "measure_desc": hit.get("measureDisplayName", ""),
+            "score": hit.get("score", 0),
+            "source": hit.get("source", ""),
+            "type": hit.get("type", ""),
+        }
+
+    # ------------------------------------------------------------------
+    # Diary groups
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_diary_groups(raw: str) -> list[dict]:
+        """Extract the user's diary groups from an authenticate() response.
+
+        Cronometer Gold exposes 8 diary group slots. They arrive as settings
+        keys ``DG01``-``DG08`` (display names) alongside ``DG01ON``-``DG08ON``
+        (enable flags), inside the settings map the authenticate call already
+        returns.
+
+        The wire ``diary_group`` value used by updateDiary is **0-based** over
+        those slots, so ``DG01`` is wire index 0. On a default account the four
+        standard meals occupy DG02-DG05, which is why the legacy hardcoded map
+        (breakfast=1 ... snacks=4) was correct.
+
+        Encoding note: the settings map is a flat ``type_ref, string_ref``
+        stream in which **the value precedes its key**. So for a key token at
+        position ``p``, the value is the string token at ``p - 2``. Do not try
+        to read the value *after* the key, and do not rely on the two strings
+        being adjacent in the string table — that holds only for values unique
+        to one key, and breaks for the shared "true"/"false" flag values.
+
+        Returns:
+            List of dicts ordered by wire index, each with ``wire_index``
+            (int), ``settings_key`` (str), ``name`` (str) and ``enabled``
+            (bool). Empty list if the response carries no DG keys.
+        """
+        try:
+            table = CronometerWebClient._extract_gwt_string_table(raw)
+        except Exception:
+            return []
+        if not table:
+            return []
+
+        ref_of = {s: str(i + 1) for i, s in enumerate(table)}
+        body = raw[: raw.rindex('["')]
+        tokens = [tok for tok in body.split(",") if tok.strip()]
+
+        def value_for(key: str) -> str | None:
+            ref = ref_of.get(key)
+            if ref is None:
+                return None
+            pos = next((i for i, tok in enumerate(tokens) if tok == ref), None)
+            if pos is None or pos < 2:
+                return None
+            tok = tokens[pos - 2]
+            if not tok.isdigit():
+                return None
+            i = int(tok)
+            return table[i - 1] if 0 < i <= len(table) else None
+
+        groups = []
+        for slot in range(1, DIARY_GROUP_SLOTS + 1):
+            key = f"DG{slot:02d}"
+            name = value_for(key)
+            if name is None:
+                continue
+            groups.append({
+                "wire_index": slot - 1,
+                "settings_key": key,
+                "name": name,
+                "enabled": value_for(f"{key}ON") == "true",
+            })
+        return groups
+
+    def _fetch_diary_groups(self) -> list[dict]:
+        """Re-issue authenticate() purely to read the settings map."""
+        body = GWT_AUTHENTICATE.replace("{gwt_header}", self.gwt_header)
+        # Through _gwt_post so a dead session is re-established; parsed
+        # directly, its //EX payload reads as "no groups" and the account's
+        # custom groups silently fall back to the defaults.
+        raw = self._gwt_post(body)
+
+        # This call rotates the session nonce server-side. Without picking the
+        # new one up, self.nonce goes stale and the next GWT write fails with
+        # NotLoggedInException even though the session is perfectly alive.
+        new_nonce = self._cookie_value("sesnonce")
+        if new_nonce:
+            self.nonce = new_nonce
+
+        return self._parse_diary_groups(raw)
+
+    @property
+    def diary_groups(self) -> list[dict]:
+        """The user's diary groups, ordered by wire index.
+
+        Populated from the authenticate response, which the client already
+        receives on login — no extra round-trip on the fresh-login path. A
+        restored session fetches lazily on first access, so callers that never
+        touch diary groups never pay for it.
+
+        Falls back to the four default meals at wire 1-4 if nothing could be
+        parsed, so a parse regression degrades to the legacy behavior rather
+        than blocking every write. A failed fetch (timeout, dead session) is
+        not a parse regression: it raises and is retried on the next access,
+        since the defaults would send writes to the wrong group on an account
+        with custom groups.
+        """
+        self.authenticate()
+        if self._diary_groups is None:
+            self._diary_groups = self._fetch_diary_groups()
+        if not self._diary_groups:
+            return [
+                {"wire_index": i, "settings_key": f"DG{i + 1:02d}",
+                 "name": n, "enabled": True}
+                for i, n in enumerate(
+                    ["Breakfast", "Lunch", "Dinner", "Snacks"], start=1
+                )
+            ]
+        return self._diary_groups
+
+    def get_food(self, food_source_id: int) -> dict:
+        """Get detailed food information including available measures.
+
+        Args:
+            food_source_id: Food source ID from find_foods results.
+
+        Returns:
+            Dict with keys:
+
+            - ``food_source_id`` (int): Echo of the input.
+            - ``raw_response`` (str): Raw GWT-RPC response for debugging.
+            - ``measures`` (list[dict]): Available serving measures, each with:
+              - ``measure_id`` (int): Numeric ID needed by add_serving.
+              - ``description`` (str): Human-readable description
+                (e.g. ``"1 large - 50g"``).
+              - ``weight_grams`` (float): Weight in grams for this measure.
+        """
+        self.authenticate()
+        body = (
+            GWT_GET_FOOD
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{food_source_id}", str(food_source_id))
+        )
+        raw = self._gwt_post(body)
+        return self._parse_get_food(raw, food_source_id)
+
+    @staticmethod
+    def _parse_get_food(raw: str, food_source_id: int) -> dict:
+        """Parse a getFood GWT-RPC response to extract measure information.
+
+        The response contains food metadata and a list of Measure objects.
+        Each Measure has fields (reading backwards from the Measure type ref):
+
+            i-6  description_ref (1-based string table index)
+            i-5  flags (0)
+            i-4  measure_id (integer, the key value needed by add_serving)
+            i-3  food_source_id
+            i-2  flags (0)
+            i-1  quantity (1.0)
+            i    <Measure type ref>
+
+        Weight in grams is a float that appears earlier in the token stream,
+        before the Measure$Type ref/back-ref for each measure.
+        """
+        result: dict = {
+            "food_source_id": food_source_id,
+            "measures": [],
+        }
+
+        if not raw.startswith("//OK[") or not raw.endswith(",0,7]"):
+            return result
+
+        # Extract string table
+        closing = ",0,7]"
+        st_close = len(raw) - len(closing) - 1
+        depth, pos, in_str = 1, st_close - 1, False
+        while pos >= 0 and depth > 0:
+            ch = raw[pos]
+            if ch == '"' and (pos == 0 or raw[pos - 1] != "\\"):
+                in_str = not in_str
+            elif not in_str:
+                if ch == "]":
+                    depth += 1
+                elif ch == "[":
+                    depth -= 1
+            pos -= 1
+        st_open = pos + 1
+        string_table: list[str] = json.loads(raw[st_open : st_close + 1])
+
+        def _resolve(ref: int) -> str | None:
+            if 1 <= ref <= len(string_table):
+                return string_table[ref - 1]
+            return None
+
+        # Find Measure class index in string table
+        measure_type_idx: int | None = None
+        for idx, entry in enumerate(string_table):
+            if entry.startswith("["):
+                continue
+            if "Measure/" in entry and "Measure$" not in entry and "Derived" not in entry:
+                if measure_type_idx is None:
+                    measure_type_idx = idx + 1
+
+        if measure_type_idx is None:
+            return result
+
+        # Tokenize data section — preserve floats
+        data_section = raw[5:st_open].rstrip(",")
+        if not data_section:
+            return result
+
+        tokens: list = []
+        for part in data_section.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            # Handle quoted strings (e.g. serving_id in Food metadata)
+            if part.startswith('"') and part.endswith('"'):
+                tokens.append(part)
+                continue
+            try:
+                tokens.append(float(part) if "." in part else int(part))
+            except ValueError:
+                tokens.append(None)
+
+        # Scan for Measure type-index occurrences and extract fields.
+        measures = []
+        for i, token in enumerate(tokens):
+            if token != measure_type_idx:
+                continue
+            if i < 6:
+                continue
+
+            measure_id_val = tokens[i - 4]
+
+            if not isinstance(measure_id_val, int):
+                continue
+
+            # Description ref is at i-6 for standard Measure layout, but
+            # CRDB foods with a boxed Double field shift it to i-7 or i-8.
+            # Scan multiple offsets to find a valid description string.
+            description = ""
+            for offset in (6, 7, 8):
+                if i < offset:
+                    continue
+                ref = tokens[i - offset]
+                if isinstance(ref, int) and 1 <= ref <= len(string_table):
+                    candidate = string_table[ref - 1]
+                    if (candidate
+                            and not candidate.startswith("com.")
+                            and not candidate.startswith("java.")
+                            and not candidate.startswith("[")):
+                        description = candidate
+                        break
+
+            # Find weight_grams: it's the float that appears before the
+            # Measure$Type ref/back-ref, which is at i-7 or i-8.
+            # Scan backwards from i-7 to find the first float.
+            weight_grams = 0.0
+            for j in range(i - 7, max(i - 12, -1), -1):
+                if isinstance(tokens[j], float):
+                    weight_grams = tokens[j]
+                    break
+
+            measures.append({
+                "measure_id": measure_id_val,
+                "description": description or "",
+                "weight_grams": round(weight_grams, 2),
+            })
+
+        result["measures"] = measures
+        return result
+
+    def add_serving(
+        self,
+        food_id: int,
+        food_source_id: int,
+        measure_id: int,
+        quantity: float,
+        weight_grams: float,
+        day: date,
+        diary_group: int = 1,
+    ) -> dict:
+        """Add a food serving to the Cronometer diary.
+
+        Args:
+            food_id: Numeric food ID from Cronometer's food database.
+            food_source_id: Food source ID (identifies the database the food
+                           comes from, e.g. USDA, custom).
+            measure_id: Measure/unit ID. Pass 0 to auto-select
+                        UNIVERSAL_MEASURE_ID (124399). The diary_group is
+                        encoded into the high 16 bits automatically.
+            quantity: Serving quantity. When using UNIVERSAL_MEASURE_ID, set
+                      this equal to weight_grams (since the measure is g-based).
+            weight_grams: Weight of the serving in grams.
+            day: Calendar date to log the entry against.
+            diary_group: Meal slot — 1=Breakfast, 2=Lunch, 3=Dinner, 4=Snacks.
+
+        Returns:
+            Dict with keys:
+                - serving_id (str): Opaque diary entry identifier (e.g. "D80lp$").
+                - food_id (int): Echo of the food_id argument.
+                - food_source_id (int): Echo of the food_source_id argument.
+        """
+        self.authenticate()
+
+        if measure_id == 0:
+            measure_id = UNIVERSAL_MEASURE_ID
+
+        # Encode diary_group into the measure_id's high 16 bits.
+        # The Cronometer server reads the diary group from this encoding:
+        #   1=Breakfast, 2=Lunch, 3=Dinner, 4=Snacks.
+        # Strip any existing group from the high bits, then apply the requested one.
+        measure_base = measure_id & 0xFFFF
+        encoded_measure = (diary_group << 16) | measure_base
+
+        # Cronometer sends integer quantities without a decimal point
+        quantity_str = str(int(quantity)) if quantity == int(quantity) else str(quantity)
+        weight_str = str(int(weight_grams)) if weight_grams == int(weight_grams) else str(weight_grams)
+
+        body = (
+            GWT_UPDATE_DIARY
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{day}", str(day.day))
+            .replace("{month}", str(day.month))
+            .replace("{year}", str(day.year))
+            .replace("{quantity}", quantity_str)
+            .replace("{diary_group}", str(diary_group))
+            .replace("{measure_id}", str(encoded_measure))
+            .replace("{weight_grams}", weight_str)
+            .replace("{food_source_id}", str(food_source_id))
+            .replace("{food_id}", str(food_id))
+        )
+
+        raw = self._gwt_post(body)
+
+        # Response format (example, live since 2026-10-30, issue #13):
+        # //OK[0,1072101,"FAoVo9",464674,50.0,2107848,0,321007,0,1,1,2026,10,30,
+        #      4,3,2,1,1,["java.util.ArrayList/...","com.cronometer..."],0,7]
+        # Positional layout (0-indexed from the inner array start):
+        #   index 2 → serving_id (quoted string)
+        #   index 1 → food_id
+        #   index 3 → food_source_id
+        inner_match = re.search(r"//OK\[(.+),\d+,7\]$", raw, re.DOTALL)
+        if not inner_match:
+            raise RuntimeError(
+                f"Unexpected updateDiary response format: {raw[:300]}"
+            )
+
+        inner = inner_match.group(1)
+        # The response layout is:
+        #   0,{food_id},"{serving_id}",{food_source_id},{weight},... ,[string_table],0,7
+        # Match the first four meaningful fields directly from the full inner string.
+        fields_match = re.match(
+            r"\d+,(\d+),\"([^\"]+)\",(\d+),",
+            inner,
+        )
+        if not fields_match:
+            raise RuntimeError(
+                f"Could not parse updateDiary response fields: {inner[:200]}"
+            )
+
+        return {
+            "serving_id": fields_match.group(2),
+            "food_id": int(fields_match.group(1)),
+            "food_source_id": int(fields_match.group(3)),
+        }
+
+    def remove_serving(self, serving_id: str) -> bool:
+        """Remove a serving entry from the Cronometer diary.
+
+        Args:
+            serving_id: Opaque diary entry identifier returned by add_serving
+                        (e.g. "D80lp$").
+
+        Returns:
+            True on success.
+
+        Raises:
+            RuntimeError: If the server returns an error or an unexpected
+                          response format.
+        """
+        self.authenticate()
+        body = (
+            GWT_REMOVE_SERVING
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{serving_id}", serving_id)
+        )
+        raw = self._gwt_post(body)
+        # Success response: //OK[[],0,7]
+        if "//OK" not in raw:
+            raise RuntimeError(f"removeServing returned unexpected response: {raw[:200]}")
+        logger.info("Removed serving %s", serving_id)
+        return True
+
+    def remove_note(self, note_id: int) -> bool:
+        """Delete a diary note. The mobile API has no way to do this."""
+        self.authenticate()
+        body = (
+            GWT_REMOVE_NOTE
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{note_id}", gwt_long(int(note_id)))
+        )
+        raw = self._gwt_post(body)
+        if "//OK" not in raw:
+            raise RuntimeError(f"removeNote returned unexpected response: {raw[:200]}")
+        logger.info("Removed note %s", note_id)
+        return True
+
+    def get_food_log(
+        self,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> list[dict]:
+        """Get detailed food log (servings) for a date range."""
+        return self.export_parsed("servings", start, end)
+
+    def get_daily_summary(
+        self,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> list[dict]:
+        """Get daily nutrition summary for a date range."""
+        return self.export_parsed("daily_summary", start, end)
+
+    # ── Macro target methods ──────────────────────────────────────────
+
+    @staticmethod
+    def _extract_gwt_string_table(raw: str) -> list[str]:
+        """Extract the string table from a GWT-RPC //OK[...] response."""
+        closing = ",0,7]"
+        st_close = len(raw) - len(closing) - 1
+        depth, pos, in_str = 1, st_close - 1, False
+        while pos >= 0 and depth > 0:
+            ch = raw[pos]
+            if ch == '"' and (pos == 0 or raw[pos - 1] != "\\"):
+                in_str = not in_str
+            elif not in_str:
+                if ch == "]":
+                    depth += 1
+                elif ch == "[":
+                    depth -= 1
+            pos -= 1
+        st_open = pos + 1
+        return json.loads(raw[st_open : st_close + 1])
+
+    @staticmethod
+    def _tokenize_gwt_data(raw: str, string_table: list[str]) -> list:
+        """Tokenize the data section of a GWT-RPC response.
+
+        Returns a list of int, float, or str tokens.
+        """
+        # Find the string table position to extract data before it
+        closing = ",0,7]"
+        st_close = len(raw) - len(closing) - 1
+        depth, pos, in_str = 1, st_close - 1, False
+        while pos >= 0 and depth > 0:
+            ch = raw[pos]
+            if ch == '"' and (pos == 0 or raw[pos - 1] != "\\"):
+                in_str = not in_str
+            elif not in_str:
+                if ch == "]":
+                    depth += 1
+                elif ch == "[":
+                    depth -= 1
+            pos -= 1
+        st_open = pos + 1
+
+        data_section = raw[5:st_open].rstrip(",")
+        if not data_section:
+            return []
+
+        tokens: list = []
+        for part in data_section.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if part.startswith('"') and part.endswith('"'):
+                tokens.append(part.strip('"'))
+                continue
+            try:
+                tokens.append(float(part) if "." in part else int(part))
+            except ValueError:
+                tokens.append(None)
+        return tokens
+
+    @staticmethod
+    def _parse_macro_target_template(raw: str) -> dict:
+        """Parse a GWT-RPC response containing a single MacroTargetTemplate.
+
+        Works for both getDailyMacroTargetTemplate and getMacroTargetTemplate
+        responses.
+
+        Returns:
+            Dict with keys: protein_g, fat_g, calories, carbs_g, template_name.
+            A macro with no target set in Cronometer is None, not 0.
+
+        Raises:
+            ValueError: If the response does not decode as a template.
+        """
+        reader = _GwtReader(raw)
+        template = reader.object()
+        reader.done()
+        if not isinstance(template, dict):
+            reader.fail("expected a MacroTargetTemplate")
+        return {
+            "protein_g": template["protein_g"],
+            "fat_g": template["fat_g"],
+            "calories": template["calories"],
+            "carbs_g": template["carbs_g"],
+            "template_name": template["template_name"],
+        }
+
+    @staticmethod
+    def _parse_all_macro_schedules(raw: str) -> list[dict]:
+        """Parse a GWT-RPC getAllMacroSchedules response.
+
+        Returns a list of 7 dicts (one per day of week), each with:
+        day_of_week (0=Sun..6=Sat), protein_g, fat_g, calories, carbs_g,
+        template_name, template_id.
+
+        A macro with no target set in Cronometer is None, not 0.
+
+        Raises:
+            ValueError: If the response does not decode as a schedule list.
+        """
+        _DOW_NAMES = [
+            "Sunday", "Monday", "Tuesday", "Wednesday",
+            "Thursday", "Friday", "Saturday",
+        ]
+
+        reader = _GwtReader(raw)
+        entries = reader.object()
+        reader.done()
+        if not isinstance(entries, list):
+            reader.fail("expected a list of MacroSchedule")
+
+        schedules = []
+        for entry in entries:
+            # The wire is ISO-ordered (0=Monday), the same as saveMacroSchedule
+            # takes; report it US-ordered (0=Sunday) as documented above.
+            dow = (entry["day_of_week"] + 1) % 7
+            template = entry["template"] or {}
+            schedules.append({
+                "day_of_week": dow,
+                "day_name": _DOW_NAMES[dow] if 0 <= dow < 7 else f"Day {dow}",
+                "protein_g": template.get("protein_g"),
+                "fat_g": template.get("fat_g"),
+                "calories": template.get("calories"),
+                "carbs_g": template.get("carbs_g"),
+                "template_name": template.get("template_name", ""),
+                "template_id": template.get("template_id", 0),
+            })
+
+        schedules.sort(key=lambda x: x["day_of_week"])
+        return schedules
+
+    def get_all_macro_schedules(self) -> list[dict]:
+        """Get the weekly macro target schedule (all 7 days).
+
+        Returns:
+            List of 7 dicts, one per day of week, each containing:
+            - day_of_week (int): 0=Sunday through 6=Saturday
+            - day_name (str): Human-readable day name
+            - protein_g (float): Protein target in grams
+            - fat_g (float): Fat target in grams
+            - calories (float): Calorie target
+            - carbs_g (float): Net carbs target in grams
+            - template_name (str): Name of the assigned template
+            - template_id (int): Template ID (0 for custom)
+        """
+        self.authenticate()
+        body = (
+            GWT_GET_ALL_MACRO_SCHEDULES
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+        )
+        raw = self._gwt_post(body)
+        return self._parse_all_macro_schedules(raw)
+
+    def get_daily_macro_targets(self, day: date | None = None) -> dict | None:
+        """Get the effective macro targets for a specific date.
+
+        Args:
+            day: Target date (defaults to today).
+
+        Returns:
+            Dict with keys: protein_g, fat_g, calories, carbs_g,
+            template_name.
+        """
+        self.authenticate()
+        if day is None:
+            day = date.today()
+        body = (
+            GWT_GET_DAILY_MACRO_TARGET_TEMPLATE
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{day}", str(day.day))
+            .replace("{month}", str(day.month))
+            .replace("{year}", str(day.year))
+        )
+        raw = self._gwt_post(body)
+        # A null template: no per-day override, the weekly default applies.
+        if raw.strip() == "//OK[0,[],0,7]":
+            return None
+        return self._parse_macro_target_template(raw)
+
+    def update_daily_targets(
+        self,
+        day: date,
+        protein_g: float,
+        fat_g: float,
+        carbs_g: float,
+        calories: float,
+        template_name: str = "Custom Targets",
+    ) -> bool:
+        """Update macro targets for a specific date.
+
+        Args:
+            day: Target date.
+            protein_g: Protein target in grams.
+            fat_g: Fat target in grams.
+            carbs_g: Net carbs target in grams.
+            calories: Calorie target.
+            template_name: Template name (default "Custom Targets").
+
+        Returns:
+            True on success.
+        """
+        self.authenticate()
+
+        # Format numeric values: integers as int, otherwise float
+        def _fmt(v: float) -> str:
+            return str(int(v)) if v == int(v) else str(v)
+
+        body = (
+            GWT_UPDATE_DAILY_TARGET_TEMPLATE
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{template_name}", template_name)
+            .replace("{day}", str(day.day))
+            .replace("{month}", str(day.month))
+            .replace("{year}", str(day.year))
+            .replace("{protein}", _fmt(protein_g))
+            .replace("{fat}", _fmt(fat_g))
+            .replace("{carbs}", _fmt(carbs_g))
+            .replace("{calories}", _fmt(calories))
+        )
+        raw = self._gwt_post(body)
+        # Success: //OK[1,2,1,["...ResponseEvent...","Success"],0,7]
+        if "Success" in raw:
+            logger.info(
+                "Updated daily targets for %s: protein=%.1fg, fat=%.1fg, "
+                "carbs=%.1fg, calories=%.0f",
+                day, protein_g, fat_g, carbs_g, calories,
+            )
+            return True
+        raise RuntimeError(
+            f"updateDailyTargetTemplate failed: {raw[:300]}"
+        )
+
+    def get_macro_target_templates(self) -> list[dict]:
+        """Get all saved macro target templates.
+
+        Returns:
+            List of dicts with keys: template_id, template_name,
+            protein_g, fat_g, calories, carbs_g.
+        """
+        self.authenticate()
+        body = (
+            GWT_GET_MACRO_TARGET_TEMPLATES
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+        )
+        raw = self._gwt_post(body)
+        return self._parse_macro_target_templates(raw)
+
+    @staticmethod
+    def _parse_macro_target_templates(raw: str) -> list[dict]:
+        """Parse getMacroTargetTemplates GWT response.
+
+        Returns list of template dicts with id, name, and macro values.
+        A macro with no target set in Cronometer is None, not 0.
+
+        Raises:
+            ValueError: If the response does not decode as a template list.
+        """
+        reader = _GwtReader(raw)
+        templates = reader.object()
+        reader.done()
+        if not isinstance(templates, list):
+            reader.fail("expected a list of MacroTargetTemplate")
+        return templates
+
+    def save_macro_schedule(
+        self,
+        day_of_week_us: int,
+        template_id: int,
+    ) -> bool:
+        """Assign a macro template to a day of the week in the schedule.
+
+        Args:
+            day_of_week_us: Day of week in US ordering (0=Sunday, 6=Saturday).
+            template_id: Template ID from get_macro_target_templates().
+                         Use 0 for the default profile targets.
+
+        Returns:
+            True on success.
+        """
+        self.authenticate()
+
+        # Convert US ordering (0=Sun) to ISO ordering (0=Mon) for the API
+        iso_dow = _US_TO_ISO_DOW[day_of_week_us]
+
+        body = (
+            GWT_SAVE_MACRO_SCHEDULE
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{day_of_week}", str(iso_dow))
+            .replace("{template_id}", str(template_id))
+        )
+        raw = self._gwt_post(body)
+        if "//OK" in raw:
+            logger.info(
+                "Set macro schedule: day_of_week=%d (US) -> %d (ISO), "
+                "template_id=%d",
+                day_of_week_us, iso_dow, template_id,
+            )
+            return True
+        raise RuntimeError(
+            f"saveMacroSchedule failed: {raw[:300]}"
+        )
+
+    def save_macro_target_template(
+        self,
+        template_name: str,
+        protein_g: float,
+        fat_g: float,
+        carbs_g: float,
+        calories: float,
+    ) -> int:
+        """Create a new saved macro target template.
+
+        Args:
+            template_name: Name for the template.
+            protein_g: Protein target in grams.
+            fat_g: Fat target in grams.
+            carbs_g: Net carbs target in grams.
+            calories: Calorie target.
+
+        Returns:
+            The template_id assigned by the server.
+        """
+        self.authenticate()
+
+        def _fmt(v: float) -> str:
+            return str(int(v)) if v == int(v) else str(v)
+
+        # Build the GWT-RPC payload dynamically because the fat field
+        # uses object back-references when fat == carbs (GWT optimization).
+        # String table positions (1-indexed):
+        #  1=module, 2=gwt_header, 3=service, 4=method, 5=String type,
+        #  6=I type, 7=MacroTargetTemplate type, 8=nonce, 9=Boolean type,
+        #  10=Double type, 11=Integer type, 12=Rigorous, 13=template_name
+        carbs_str = _fmt(carbs_g)
+        fat_str = _fmt(fat_g)
+        cal_str = _fmt(calories)
+        protein_str = _fmt(protein_g)
+
+        if fat_g == carbs_g:
+            # Fat equals carbs: use back-reference -3 (refers to
+            # the Double object at position 3 in the object stream)
+            fat_token = "-3"
+        else:
+            # Fat differs: encode explicitly
+            fat_token = f"10|{fat_str}"
+
+        # The data section encodes the MacroTargetTemplate fields.
+        # Field order: boolean, carbs, fat, null, calories,
+        #   [extra fields], template_id(0=new), program("Rigorous"),
+        #   null, template_name, protein, [trailing ref]
+        #
+        # When fat==carbs, trailing back-refs like -6 refer to
+        # Double(calories). When fat!=carbs, the object positions
+        # shift so we use explicit values instead.
+        if fat_g == carbs_g:
+            data = (
+                f"8|{self.user_id}|"
+                f"7|9|0|10|{carbs_str}|-3|0|10|{cal_str}|-3|-3|0|"
+                f"11|0|12|0|13|10|{protein_str}|-6|"
+            )
+        else:
+            data = (
+                f"8|{self.user_id}|"
+                f"7|9|0|10|{carbs_str}|10|{fat_str}|0|10|{cal_str}|"
+                f"10|{fat_str}|10|{fat_str}|0|"
+                f"11|0|12|0|13|10|{protein_str}|10|{cal_str}|"
+            )
+
+        header = (
+            "7|0|13|https://cronometer.com/cronometer/|"
+            f"{self.gwt_header}|"
+            "com.cronometer.shared.rpc.CronometerService|"
+            "saveMacroTargetTemplate|java.lang.String/2004016611|"
+            "I|com.cronometer.shared.targets.models.MacroTargetTemplate/"
+            "3691130822|"
+            f"{self.nonce or ''}|"
+            "java.lang.Boolean/476441737|"
+            "java.lang.Double/858496421|"
+            "java.lang.Integer/3438268394|"
+            "Rigorous|"
+            f"{template_name}|"
+            "1|2|3|4|3|5|6|7|"
+        )
+
+        body = header + data
+        raw = self._gwt_post(body)
+
+        if "//OK" not in raw:
+            raise RuntimeError(
+                f"saveMacroTargetTemplate failed: {raw[:300]}"
+            )
+
+        logger.info(
+            "Created macro target template '%s': protein=%.1fg, "
+            "fat=%.1fg, carbs=%.1fg, calories=%.0f",
+            template_name, protein_g, fat_g, carbs_g, calories,
+        )
+
+        # Fetch templates to get the server-assigned template_id
+        templates = self.get_macro_target_templates()
+        for t in templates:
+            if t["template_name"] == template_name:
+                return t["template_id"]
+
+        # Template was created but not found — return 0 as fallback
+        logger.warning(
+            "Template '%s' created but not found in template list",
+            template_name,
+        )
+        return 0
+
+    def delete_macro_target_template(self, template_id: int) -> bool:
+        """Delete a saved macro target template.
+
+        Args:
+            template_id: Template ID to delete.
+
+        Returns:
+            True on success.
+        """
+        self.authenticate()
+        body = (
+            GWT_DELETE_MACRO_TARGET_TEMPLATE
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{template_id}", str(template_id))
+        )
+        raw = self._gwt_post(body)
+        if "//OK" in raw:
+            logger.info("Deleted macro target template: id=%d", template_id)
+            return True
+        raise RuntimeError(
+            f"deleteMacroTargetTemplate failed: {raw[:300]}"
+        )
+
+    # --- Fasting methods ---
+
+    def get_user_fasts(self) -> list[dict]:
+        """Get all fasting history.
+
+        Returns:
+            List of fast dicts with keys: fast_id, recurrence_id, name,
+            recurrence_rule, start_ts, end_ts, notes, is_active.
+        """
+        self.authenticate()
+        body = (
+            GWT_GET_USER_FASTS
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+        )
+        raw = self._gwt_post(body)
+        return self._parse_fasts(raw)
+
+    def get_user_fasts_for_range(
+        self, start: date, end: date,
+    ) -> list[dict]:
+        """Get fasts for a specific date range.
+
+        Args:
+            start: Start date.
+            end: End date.
+
+        Returns:
+            List of fast dicts.
+        """
+        self.authenticate()
+        body = (
+            GWT_GET_USER_FASTS_FOR_RANGE
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{start_day}", str(start.day))
+            .replace("{start_month}", str(start.month))
+            .replace("{start_year}", str(start.year))
+            .replace("{end_day}", str(end.day))
+            .replace("{end_month}", str(end.month))
+            .replace("{end_year}", str(end.year))
+        )
+        raw = self._gwt_post(body)
+        return self._parse_fasts(raw)
+
+    def get_fasting_stats(self) -> dict:
+        """Get aggregate fasting statistics.
+
+        Returns:
+            Dict with keys: total_hours, longest_fast_hours,
+            seven_fast_avg_hours, completed_count.
+        """
+        self.authenticate()
+        body = (
+            GWT_GET_FASTING_STATS
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+        )
+        raw = self._gwt_post(body)
+        return self._parse_fasting_stats(raw)
+
+    def delete_fast(self, fast_id: int) -> bool:
+        """Delete a fast entry.
+
+        Args:
+            fast_id: Fast ID to delete.
+
+        Returns:
+            True on success.
+        """
+        self.authenticate()
+        body = (
+            GWT_DELETE_FAST
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{fast_id}", str(fast_id))
+        )
+        raw = self._gwt_post(body)
+        if "//OK" in raw:
+            logger.info("Deleted fast: id=%d", fast_id)
+            return True
+        raise RuntimeError(f"deleteFast failed: {raw[:300]}")
+
+    def cancel_fast_keep_series(self, fast_id: int) -> bool:
+        """Cancel an active fast while preserving the recurring schedule.
+
+        Args:
+            fast_id: The recurrence/fast ID of the active fast.
+
+        Returns:
+            True on success.
+        """
+        self.authenticate()
+        body = (
+            GWT_CANCEL_FAST_KEEP_SERIES
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{fast_id}", str(fast_id))
+        )
+        raw = self._gwt_post(body)
+        if "//OK" in raw:
+            logger.info("Cancelled fast (kept series): id=%d", fast_id)
+            return True
+        raise RuntimeError(
+            f"cancelFastAndKeepSeries failed: {raw[:300]}"
+        )
+
+    @staticmethod
+    def _parse_fasting_stats(raw: str) -> dict:
+        """Parse getFastingStats GWT response.
+
+        Response format:
+        //OK[{totalHours},{longestFast},{sevenFastAvg},{completedCount},
+             1,[...string table...],0,7]
+        """
+        if not raw.startswith("//OK["):
+            return {}
+
+        string_table = CronometerWebClient._extract_gwt_string_table(raw)
+        tokens = CronometerWebClient._tokenize_gwt_data(raw, string_table)
+
+        floats = [t for t in tokens if isinstance(t, float)]
+        ints = [t for t in tokens if isinstance(t, int)]
+
+        result = {
+            "total_hours": 0.0,
+            "longest_fast_hours": 0.0,
+            "seven_fast_avg_hours": 0.0,
+            "completed_count": 0,
+        }
+
+        if len(floats) >= 3:
+            result["total_hours"] = round(floats[0], 1)
+            result["longest_fast_hours"] = round(floats[1], 1)
+            result["seven_fast_avg_hours"] = round(floats[2], 1)
+
+        # completed_count is typically the first large-ish int
+        # (after string table refs which are small)
+        for val in ints:
+            if val > len(string_table) and val < 100000:
+                result["completed_count"] = val
+                break
+
+        return result
+
+    @staticmethod
+    def _parse_fasts(raw: str) -> list[dict]:
+        """Parse getUserFasts or getUserFastsForRange GWT response.
+
+        Extracts Fast objects from the GWT-RPC response. Each Fast has:
+        - fast_id (int)
+        - recurrence_id (int)
+        - name (str)
+        - recurrence_rule (str, e.g. "FREQ=WEEKLY")
+        - start_ts (str, base62 timestamp)
+        - end_ts (str, base62 timestamp or "0")
+        - is_active (bool, True if end_ts is "0" or empty)
+        """
+        if not raw.startswith("//OK["):
+            return []
+
+        string_table = CronometerWebClient._extract_gwt_string_table(raw)
+        tokens = CronometerWebClient._tokenize_gwt_data(raw, string_table)
+
+        # Find the Fast type in string table
+        fast_type_idx = None
+        for idx, entry in enumerate(string_table):
+            if "fasting.Fast/" in entry and "[L" not in entry:
+                fast_type_idx = idx + 1
+                break
+
+        if fast_type_idx is None:
+            return []
+
+        # Find FastingRecurrance type
+        recurrence_type_idx = None
+        for idx, entry in enumerate(string_table):
+            if "FastingRecurrance/" in entry:
+                recurrence_type_idx = idx + 1
+                break
+
+        # Extract meaningful strings (fast names, recurrence rules, notes)
+        meaningful_strings = {}
+        for idx, entry in enumerate(string_table):
+            if (
+                not entry.startswith("com.")
+                and not entry.startswith("java.")
+                and not entry.startswith("[")
+            ):
+                meaningful_strings[idx + 1] = entry
+                meaningful_strings[-(idx + 1)] = entry
+
+        # Find the first Fast type ref to determine block size
+        first_fast_pos = None
+        for i, token in enumerate(tokens):
+            if token == fast_type_idx:
+                first_fast_pos = i
+                break
+
+        if first_fast_pos is None:
+            return []
+
+        block_size = first_fast_pos + 1
+
+        # Extract blocks
+        fasts = []
+        block_idx = 0
+        while True:
+            start = block_idx * block_size
+            end = start + block_size
+            if end > len(tokens):
+                break
+
+            block = tokens[start:end]
+
+            # Extract strings from this block (fast name, recurrence rule,
+            # notes). Strings are referenced by string table index.
+            block_strings = []
+            for t in block:
+                if isinstance(t, str):
+                    block_strings.append(t)
+                elif isinstance(t, int) and t in meaningful_strings:
+                    block_strings.append(meaningful_strings[t])
+                elif isinstance(t, int) and t < 0 and t in meaningful_strings:
+                    block_strings.append(meaningful_strings[t])
+
+            # Extract large ints (fast_id, recurrence_id)
+            large_ints = [
+                t for t in block
+                if isinstance(t, int)
+                and abs(t) > len(string_table)
+                and abs(t) < 10**9
+            ]
+
+            # Extract quoted strings (base62 timestamps)
+            quoted_strings = [t for t in block if isinstance(t, str)]
+
+            # Build fast dict
+            fast = {
+                "fast_id": large_ints[0] if len(large_ints) >= 1 else 0,
+                "recurrence_id": large_ints[1] if len(large_ints) >= 2 else 0,
+                "name": "",
+                "recurrence_rule": "",
+                "start_ts": "",
+                "end_ts": "",
+                "is_active": False,
+            }
+
+            # Assign strings heuristically
+            for s in block_strings:
+                if s.startswith("FREQ="):
+                    fast["recurrence_rule"] = s
+                elif any(c.isalpha() and c.isupper() for c in s) and len(s) < 10 and s != "0":
+                    # Likely a base62 timestamp
+                    if not fast["start_ts"]:
+                        fast["start_ts"] = s
+                    else:
+                        fast["end_ts"] = s
+                elif len(s) > 3:
+                    # Likely a name or note
+                    if not fast["name"]:
+                        fast["name"] = s
+                    # Additional strings could be notes
+
+            # Timestamps from quoted strings in the block
+            for s in quoted_strings:
+                if s and s != "0" and len(s) >= 5:
+                    if not fast["start_ts"]:
+                        fast["start_ts"] = s
+                    elif not fast["end_ts"]:
+                        fast["end_ts"] = s
+
+            fast["is_active"] = fast["end_ts"] in ("", "0")
+
+            if fast["fast_id"] or fast["name"]:
+                fasts.append(fast)
+
+            block_idx += 1
+
+        return fasts
+
+    # --- Biometric methods ---
+
+    def get_recent_biometrics(self) -> list[dict]:
+        """Get the most recently logged biometric entries.
+
+        Returns:
+            List of dicts with keys: biometric_id, metric_id, value,
+            date, metric_name (if available).
+        """
+        self.authenticate()
+        body = (
+            GWT_GET_RECENT_BIOMETRICS
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+        )
+        raw = self._gwt_post(body)
+        return self._parse_recent_biometrics(raw)
+
+    def add_biometric(
+        self,
+        metric_type: str,
+        value: float,
+        day: date,
+    ) -> str:
+        """Add a biometric entry.
+
+        Args:
+            metric_type: One of 'weight', 'blood_glucose', 'heart_rate',
+                         'body_fat'.
+            value: The value in display units (lbs, mg/dL, bpm, %).
+            day: Date for the entry.
+
+        Returns:
+            The biometric entry ID (string).
+        """
+        self.authenticate()
+
+        if metric_type not in _BIOMETRIC_TYPES:
+            raise ValueError(
+                f"Unknown metric_type '{metric_type}'. "
+                f"Supported: {list(_BIOMETRIC_TYPES.keys())}"
+            )
+
+        info = _BIOMETRIC_TYPES[metric_type]
+
+        def _fmt(v: float) -> str:
+            return str(int(v)) if v == int(v) else str(v)
+
+        body = (
+            GWT_ADD_BIOMETRIC
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{value}", _fmt(value))
+            .replace("{day}", str(day.day))
+            .replace("{month}", str(day.month))
+            .replace("{year}", str(day.year))
+            .replace("{flags}", str(info["flags"]))
+            .replace("{metric_position}", str(info["metric_position"]))
+        )
+        raw = self._gwt_post(body)
+
+        if "//OK" not in raw:
+            raise RuntimeError(f"addBiometric failed: {raw[:300]}")
+
+        # Extract biometric ID from response: //OK["BXW0DA",[],0,7]
+        biometric_id = ""
+        if raw.startswith("//OK["):
+            import re
+            match = re.search(r'"([A-Za-z0-9$_]+)"', raw)
+            if match:
+                biometric_id = match.group(1)
+
+        logger.info(
+            "Added biometric: type=%s, value=%.1f, date=%s, id=%s",
+            metric_type, value, day, biometric_id,
+        )
+        return biometric_id
+
+    def remove_biometric(self, biometric_id: str) -> bool:
+        """Remove a biometric entry.
+
+        Args:
+            biometric_id: The biometric entry ID (e.g. "BXW0DA").
+
+        Returns:
+            True on success.
+        """
+        self.authenticate()
+        body = (
+            GWT_REMOVE_MEASUREMENT
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{biometric_id}", biometric_id)
+        )
+        raw = self._gwt_post(body)
+        if "//OK" in raw:
+            logger.info("Removed biometric: id=%s", biometric_id)
+            return True
+        raise RuntimeError(f"removeMeasurement failed: {raw[:300]}")
+
+    def _parse_recent_biometrics(self, raw: str) -> list[dict]:
+        """Parse getRecentBiometrics GWT response.
+
+        Returns list of biometric entries with id, metric_id, value, date.
+        """
+        if not raw.startswith("//OK["):
+            return []
+
+        string_table = CronometerWebClient._extract_gwt_string_table(raw)
+        tokens = CronometerWebClient._tokenize_gwt_data(raw, string_table)
+
+        # Find the Biometric type in string table
+        bio_type_idx = None
+        for idx, entry in enumerate(string_table):
+            if "biometrics.Biometric/" in entry and "[L" not in entry:
+                bio_type_idx = idx + 1
+                break
+
+        if bio_type_idx is None:
+            return []
+
+        # Find Day type
+        day_type_idx = None
+        for idx, entry in enumerate(string_table):
+            if "models.Day/" in entry:
+                day_type_idx = idx + 1
+                break
+
+        # Find first Biometric type ref to determine block size
+        first_bio_pos = None
+        for i, token in enumerate(tokens):
+            if token == bio_type_idx:
+                first_bio_pos = i
+                break
+
+        if first_bio_pos is None:
+            return []
+
+        block_size = first_bio_pos + 1
+
+        # Extract meaningful strings (biometric IDs, composite JSON, etc.)
+        meaningful_strings = {}
+        for idx, entry in enumerate(string_table):
+            if (
+                not entry.startswith("com.")
+                and not entry.startswith("java.")
+                and not entry.startswith("[")
+            ):
+                meaningful_strings[idx + 1] = entry
+                meaningful_strings[-(idx + 1)] = entry
+
+        biometrics = []
+        block_idx = 0
+        while True:
+            start = block_idx * block_size
+            end = start + block_size
+            if end > len(tokens):
+                break
+
+            block = tokens[start:end]
+
+            # Extract floats (biometric value)
+            floats = [t for t in block if isinstance(t, float)]
+
+            # Extract strings (biometric ID, composite JSON)
+            block_strings = []
+            for t in block:
+                if isinstance(t, str):
+                    block_strings.append(t)
+                elif isinstance(t, int) and t in meaningful_strings:
+                    block_strings.append(meaningful_strings[t])
+
+            # Extract large ints (metric_id, user_id, flags)
+            large_ints = [
+                t for t in block
+                if isinstance(t, int)
+                and abs(t) > len(string_table)
+            ]
+
+            # Build entry
+            entry = {
+                "biometric_id": "",
+                "value": floats[0] if floats else 0.0,
+                "metric_id": 0,
+                "date": "",
+            }
+
+            # Biometric IDs are short alphanumeric strings (6-8 chars)
+            for s in block_strings:
+                if (
+                    len(s) >= 4 and len(s) <= 12
+                    and s.isalnum()
+                    and not s.startswith("com")
+                ):
+                    entry["biometric_id"] = s
+                elif s.startswith("{"):
+                    # Composite JSON (blood pressure, etc.)
+                    entry["composite"] = s
+
+            # Extract date: look for 3 consecutive small ints that
+            # could be day/month/year
+            for i in range(len(block) - 2):
+                if (
+                    isinstance(block[i], int)
+                    and isinstance(block[i + 1], int)
+                    and isinstance(block[i + 2], int)
+                    and 1 <= block[i] <= 31
+                    and 1 <= block[i + 1] <= 12
+                    and 2020 <= block[i + 2] <= 2030
+                ):
+                    entry["date"] = (
+                        f"{block[i + 2]:04d}-{block[i + 1]:02d}-"
+                        f"{block[i]:02d}"
+                    )
+                    break
+
+            # metric_id is typically in the large_ints
+            for val in large_ints:
+                if val < 100000 and val != int(self.user_id or 0):
+                    entry["metric_id"] = val
+                    break
+
+            if entry["biometric_id"] or entry["value"]:
+                biometrics.append(entry)
+
+            block_idx += 1
+
+        return biometrics
+
+    # ── Diary operations ──────────────────────────────────────────────
+
+    def copy_day(self, src: date, dst: date) -> bool:
+        """Copy all diary entries from one date to another.
+
+        This is a server-side operation that copies ALL entries
+        (food, exercise, notes, biometrics) from src to dst. It is
+        additive — existing entries on dst are not removed.
+
+        Args:
+            src: Source date to copy from.
+            dst: Destination date to copy to.
+
+        Returns:
+            True on success.
+        """
+        self.authenticate()
+        body = (
+            GWT_COPY_DAY
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{src_day}", str(src.day))
+            .replace("{src_month}", str(src.month))
+            .replace("{src_year}", str(src.year))
+            .replace("{dst_day}", str(dst.day))
+            .replace("{dst_month}", str(dst.month))
+            .replace("{dst_year}", str(dst.year))
+        )
+        raw = self._gwt_post(body)
+        if not raw.startswith("//OK"):
+            raise RuntimeError(f"copyDay failed: {raw[:300]}")
+        return True
+
+    def set_day_complete(self, day: date, complete: bool = True) -> bool:
+        """Mark a diary day as complete or incomplete.
+
+        Args:
+            day: The date to mark.
+            complete: True to mark complete, False to mark incomplete.
+
+        Returns:
+            True on success.
+        """
+        self.authenticate()
+        body = (
+            GWT_SET_DAY_COMPLETE
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{day}", str(day.day))
+            .replace("{month}", str(day.month))
+            .replace("{year}", str(day.year))
+            .replace("{complete}", "1" if complete else "0")
+        )
+        raw = self._gwt_post(body)
+        if not raw.startswith("//OK"):
+            raise RuntimeError(f"setDayComplete failed: {raw[:300]}")
+        return True
+
+    # ── Repeat item methods ───────────────────────────────────────────
+
+    def get_repeated_items(self) -> list[dict]:
+        """Get all recurring food entries.
+
+        Returns:
+            List of repeat item dicts with keys: repeat_item_id,
+            food_name, food_source_id, measure_id, quantity,
+            diary_group, days_of_week.
+        """
+        self.authenticate()
+        body = (
+            GWT_GET_REPEATED_ITEMS
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+        )
+        raw = self._gwt_post(body)
+        return self._parse_repeated_items(raw)
+
+    def add_repeat_item(
+        self,
+        food_source_id: int,
+        food_id: int,
+        quantity: float,
+        food_name: str,
+        diary_group: int = 1,
+        days_of_week: list[int] | None = None,
+    ) -> bool:
+        """Add a recurring food entry.
+
+        Args:
+            food_source_id: Food source ID from search_foods.
+            food_id: Food ID from search_foods.
+            quantity: Number of default servings (e.g., 12 cups of coffee).
+            food_name: Display name for the food.
+            diary_group: Meal slot — 1=Breakfast, 2=Lunch, 3=Dinner, 4=Snacks.
+            days_of_week: List of days (0=Sun, 1=Mon, ..., 6=Sat).
+                          Defaults to all 7 days.
+
+        Returns:
+            True on success.
+        """
+        self.authenticate()
+
+        if days_of_week is None:
+            days_of_week = [0, 1, 2, 3, 4, 5, 6]
+
+        # Build day entries: "10|{day}" for each day, joined by "|"
+        day_entries = "|".join(f"10|{d}" for d in days_of_week)
+
+        # Format quantity as float-like string for GWT
+        qty_str = str(int(quantity)) if quantity == int(quantity) else str(quantity)
+
+        body = (
+            GWT_ADD_REPEAT_ITEM
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{food_name}", food_name)
+            .replace("{diary_group}", str(diary_group))
+            .replace("{day_count}", str(len(days_of_week)))
+            .replace("{day_entries}", day_entries)
+            .replace("{quantity}", qty_str)
+            .replace("{food_source_id}", str(food_source_id))
+            .replace("{food_id}", str(food_id))
+        )
+        raw = self._gwt_post(body)
+        if not raw.startswith("//OK"):
+            raise RuntimeError(f"addRepeatItem failed: {raw[:300]}")
+        return True
+
+    def delete_repeat_item(self, repeat_item_id: int) -> bool:
+        """Delete a recurring food entry.
+
+        Args:
+            repeat_item_id: The ID of the repeat item to delete.
+
+        Returns:
+            True on success.
+        """
+        self.authenticate()
+        body = (
+            GWT_DELETE_REPEAT_ITEM
+            .replace("{gwt_header}", self.gwt_header)
+            .replace("{nonce}", self.nonce or "")
+            .replace("{user_id}", self.user_id or "")
+            .replace("{repeat_item_id}", str(repeat_item_id))
+        )
+        raw = self._gwt_post(body)
+        if not raw.startswith("//OK"):
+            raise RuntimeError(f"deleteRepeatItem failed: {raw[:300]}")
+        return True
+
+    @staticmethod
+    def _parse_repeated_items(raw: str) -> list[dict]:
+        """Parse a GWT-RPC getRepeatedItems response.
+
+        GWT writes the data section in reverse, so it is read back to front.
+        Per response: ArrayList ref, item count, then for each RepeatItem:
+
+            RepeatItem ref, quantity (float), flag, day_count,
+            day_count x (Integer ref, day value),
+            unknown, food_name ref, flag,
+            repeat_item_id, food_source_id, food_id, trailing
+
+        Two real responses confirm the layout::
+
+            coffee: 12.0, 1, 7 days[0-6], 0, name, 0, 658545, 5828,   16104
+            wasa:    3.0, 1, 1 day  [1],  0, name, 1, 658384, 461776, 1055762
+
+        and coffee's 5828 / 16104 match that food's ids from food search.
+
+        The previous implementation guessed positions by scanning for "large
+        ints", which left repeat_item_id as 0 on every item and so made
+        delete_repeat_item unable to target anything.
+        """
+        if not raw.startswith("//OK"):
+            return []
+
+        try:
+            string_table = CronometerWebClient._extract_gwt_string_table(raw)
+        except Exception:
+            return []
+
+        st_open = raw.rindex('["')
+        data_section = raw[5:st_open].rstrip(",")
+        if not data_section:
+            return []
+
+        tokens: list = []
+        for part in data_section.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                tokens.append(float(part) if "." in part else int(part))
+            except ValueError:
+                tokens.append(None)
+
+        rev = tokens[::-1]
+
+        def name_at(ref) -> str:
+            if isinstance(ref, int) and 0 < ref <= len(string_table):
+                return string_table[ref - 1]
+            return ""
+
+        items: list[dict] = []
+        # GWT numbers every object it writes, from 1, and sends a repeat as
+        # -n. Here the objects are: the outer ArrayList, then per item the
+        # RepeatItem, its days ArrayList (the "flag" slot), and each new
+        # Integer. Only the Integers are ever repeated.
+        objects: dict[int, object] = {}
+        next_obj = 1
+        try:
+            i = 1                       # skip the ArrayList type ref
+            next_obj += 1
+            count = rev[i]; i += 1
+            if not isinstance(count, int) or count < 0:
+                return []
+            for _ in range(count):
+                i += 1                  # RepeatItem type ref
+                next_obj += 1
+                quantity = rev[i]; i += 1
+                i += 1                  # days ArrayList type ref
+                next_obj += 1
+                day_count = rev[i]; i += 1
+                days: list = []
+                for _ in range(day_count):
+                    tok = rev[i]
+                    if isinstance(tok, int) and tok < 0:
+                        # Back-reference to an Integer already written.
+                        days.append(objects.get(-tok)); i += 1
+                    else:
+                        i += 1          # Integer type ref
+                        objects[next_obj] = rev[i]
+                        next_obj += 1
+                        days.append(rev[i]); i += 1
+                i += 1                  # unknown
+                food_name = name_at(rev[i]); i += 1
+                # The addRepeatItem payload carries diary_group in this slot,
+                # but the response does NOT echo it back. Two live experiments:
+                # sent wire 2, read 1; sent wire 4, read 1. It is 1 for every
+                # item created through the API and 0 for one created in the
+                # Cronometer UI, so it behaves like a flag, not a group. Not
+                # reported rather than reported wrong.
+                i += 1
+                repeat_item_id = rev[i]; i += 1
+                food_source_id = rev[i]; i += 1
+                food_id = rev[i]; i += 1
+                i += 1                  # trailing
+                items.append({
+                    "repeat_item_id": repeat_item_id,
+                    "food_name": food_name,
+                    "food_source_id": food_source_id,
+                    "food_id": food_id,
+                    "quantity": quantity,
+                    "days_of_week": days,
+                })
+        except (IndexError, TypeError):
+            return items
+
+        return items

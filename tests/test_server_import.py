@@ -1,0 +1,117 @@
+"""Import and tool-registration tests for the server module.
+
+server.py is imported by the console entry point, so an import-time failure
+takes the whole server down before it serves a request -- and nothing else in
+the suite imports it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+EXPECTED_TOOLS = {
+    "add_biometric",
+    "add_custom_food",
+    "add_exercise",
+    "add_fast",
+    "add_food_entry",
+    "add_note",
+    "copy_day",
+    "create_recipe",
+    "delete_fast",
+    "edit_biometric",
+    "edit_exercise",
+    "edit_fast",
+    "edit_food_entry",
+    "edit_note",
+    "get_biometrics",
+    "get_daily_nutrition",
+    "get_fasting_history",
+    "get_fasting_stats",
+    "get_food_details",
+    "get_food_log",
+    "get_macro_targets",
+    "get_nutrition_scores",
+    "get_profile",
+    "get_recent_foods",
+    "get_result_page",
+    "get_streak",
+    "update_recipe",
+    "update_custom_food",
+    "list_recipes",
+    "list_custom_foods",
+    "find_entries_by_food",
+    "get_targets",
+    "list_biometrics",
+    "list_nutrients",
+    "mark_day_complete",
+    "remove_biometric",
+    "remove_exercise",
+    "remove_food_entry",
+    "remove_note",
+    "retire_custom_food",
+    "search_foods",
+    "set_nutrient_target",
+    "add_repeat_item",
+    "analyze_day",
+    "cancel_active_fast",
+    "check_food_fit",
+    "connection_status",
+    "create_macro_template",
+    "delete_macro_template",
+    "delete_repeat_item",
+    "export_data",
+    "fetch",
+    "get_daily_macro_targets",
+    "get_nutrition_summary",
+    "get_repeated_items",
+    "import_recipe",
+    "list_diary_groups",
+    "list_macro_templates",
+    "log_sleep",
+    "lookup_barcode",
+    "nutrient_report",
+    "search",
+    "search_activities",
+    "set_macro_targets",
+    "set_weekly_macro_schedule",
+}
+
+
+def test_server_module_imports():
+    """The entry point does `from cronometer_mcp.server import main`."""
+    from cronometer_mcp import server
+
+    assert callable(server.main)
+
+
+def test_server_identity():
+    from cronometer_mcp.server import mcp
+
+    assert mcp.name == "cronometer"
+
+
+def test_registered_tools():
+    """Tools register as an import side effect of the @mcp.tool() decorators.
+
+    Descriptions come from the docstrings and are what the model reads to pick
+    a tool, so an empty one is a silent regression.
+    """
+    from cronometer_mcp.server import mcp
+
+    tools = asyncio.run(mcp.list_tools())
+
+    assert {tool.name for tool in tools} == EXPECTED_TOOLS
+    for tool in tools:
+        assert tool.description, f"{tool.name} has no description"
+
+
+def test_no_client_constructed_at_import():
+    """Import must not need credentials or touch the network.
+
+    The server is spawned fresh for every stdio session; the client is built
+    lazily on the first tool call instead.
+    """
+    from cronometer_mcp import server
+
+    assert server._client is None
